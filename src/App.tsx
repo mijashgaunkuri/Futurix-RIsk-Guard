@@ -23,6 +23,7 @@ import {
   ChevronDown,
   ArrowUpDown,
   Eye,
+  Edit3,
   Image as ImageIcon,
   Clock,
   Search, 
@@ -147,6 +148,8 @@ export default function App() {
   const [nprRate, setNprRate] = useState<number>(134); // Fallback rate
   const [user, setUser] = useState<FirebaseUser | null>(null);
   const [isAuthReady, setIsAuthReady] = useState(false);
+  const [isSigningIn, setIsSigningIn] = useState(false);
+  const [authError, setAuthError] = useState<string | null>(null);
 
   // Auth Listener
   useEffect(() => {
@@ -240,6 +243,7 @@ export default function App() {
   }, []);
 
   const [deletingTradeId, setDeletingTradeId] = useState<string | null>(null);
+  const [editingTrade, setEditingTrade] = useState<Trade | null>(null);
 
   const updateBalance = async (amount: number, type: 'DEPOSIT' | 'WITHDRAWAL' | 'TRADE' | 'RESET', note: string = '') => {
     if (!user) return;
@@ -288,12 +292,22 @@ export default function App() {
     }
   };
 
-  const handleUpdateTrade = async (trade: Trade) => {
+  const handleUpdateTrade = async (updatedTrade: Trade) => {
     if (!user) return;
     try {
-      await setDoc(doc(db, 'users', user.uid, 'trades', trade.id), cleanObject(trade));
+      const oldTrade = trades.find(t => t.id === updatedTrade.id);
+      
+      // If it's a CLOSED trade and Net PNL changed, update balance
+      if (oldTrade && oldTrade.status === 'CLOSED' && updatedTrade.status === 'CLOSED') {
+        const pnlDiff = updatedTrade.netPnl - oldTrade.netPnl;
+        if (Math.abs(pnlDiff) > 0.001) {
+          await updateBalance(pnlDiff, 'TRADE', `Adjustment for trade ${updatedTrade.symbol}`);
+        }
+      }
+
+      await setDoc(doc(db, 'users', user.uid, 'trades', updatedTrade.id), cleanObject(updatedTrade));
     } catch (error) {
-      handleFirestoreError(error, OperationType.UPDATE, `users/${user.uid}/trades/${trade.id}`);
+      handleFirestoreError(error, OperationType.UPDATE, `users/${user.uid}/trades/${updatedTrade.id}`);
     }
   };
 
@@ -389,6 +403,28 @@ export default function App() {
   }
 
   if (!user) {
+    const handleSignIn = async () => {
+      if (isSigningIn) return;
+      setIsSigningIn(true);
+      setAuthError(null);
+      try {
+        await signInWithGoogle();
+      } catch (error: any) {
+        console.error("Sign in failed:", error);
+        if (error.code === 'auth/popup-blocked') {
+          setAuthError("Popup blocked! Please allow popups for this site and try again. Check your browser's address bar for a blocked popup icon.");
+        } else if (error.code === 'auth/cancelled-popup-request' || error.code === 'auth/popup-closed-by-user') {
+          setAuthError("Sign-in was cancelled. Please try again.");
+        } else if (error.code === 'auth/network-request-failed') {
+          setAuthError("Network error. This can be caused by ad-blockers, firewalls, or third-party cookie restrictions in your browser. Please disable ad-blockers and allow third-party cookies for this site.");
+        } else {
+          setAuthError("An unexpected error occurred during sign-in. Please try again.");
+        }
+      } finally {
+        setIsSigningIn(false);
+      }
+    };
+
     return (
       <div className="min-h-screen bg-zinc-950 flex items-center justify-center p-4">
         <div className="max-w-md w-full crypto-card space-y-8 text-center">
@@ -403,12 +439,23 @@ export default function App() {
           </div>
           
           <div className="space-y-4 pt-8">
+            {authError && (
+              <div className="p-3 bg-rose-500/10 border border-rose-500/20 rounded-xl text-rose-500 text-xs flex items-center gap-2 animate-in fade-in slide-in-from-top-2">
+                <AlertTriangle className="w-4 h-4 shrink-0" />
+                <span>{authError}</span>
+              </div>
+            )}
             <button 
-              onClick={signInWithGoogle}
-              className="w-full btn-primary flex items-center justify-center gap-3 py-4 text-lg"
+              onClick={handleSignIn}
+              disabled={isSigningIn}
+              className="w-full btn-primary flex items-center justify-center gap-3 py-4 text-lg disabled:opacity-50 disabled:cursor-not-allowed"
             >
-              <Smile className="w-6 h-6" />
-              Sign in with Google
+              {isSigningIn ? (
+                <RefreshCw className="w-6 h-6 animate-spin" />
+              ) : (
+                <Smile className="w-6 h-6" />
+              )}
+              {isSigningIn ? 'Signing in...' : 'Sign in with Google'}
             </button>
             <p className="text-xs text-zinc-500">
               Securely store your trades in the cloud and access them from any device.
@@ -543,6 +590,8 @@ export default function App() {
             onDeleteTrade={handleDeleteTrade}
             onUpdateTrade={handleUpdateTrade}
             setDeletingTradeId={setDeletingTradeId}
+            editingTrade={editingTrade}
+            setEditingTrade={setEditingTrade}
             exportData={exportData}
             importData={importData}
             clearData={clearData}
@@ -1340,6 +1389,7 @@ const LogTradeModal = ({ results, symbol, direction, leverage, entryPrice, stopL
   const [tags, setTags] = useState<string[]>([]);
   const [tagInput, setTagInput] = useState('');
   const [updateGlobalBalance, setUpdateGlobalBalance] = useState(true);
+  const [isConfirmed, setIsConfirmed] = useState(false);
   const [screenshot, setScreenshot] = useState<string | null>(null);
 
   useEffect(() => {
@@ -1421,7 +1471,7 @@ const LogTradeModal = ({ results, symbol, direction, leverage, entryPrice, stopL
         </div>
 
         <div className="p-6 space-y-6">
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-4 p-4 bg-zinc-950 rounded-xl border border-zinc-800">
+          <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4 p-4 bg-zinc-950 rounded-xl border border-zinc-800">
             <div>
               <span className="text-[10px] text-zinc-500 uppercase block">Symbol</span>
               <span className="font-bold">{symbol}</span>
@@ -1431,12 +1481,20 @@ const LogTradeModal = ({ results, symbol, direction, leverage, entryPrice, stopL
               <span className={cn("font-bold", direction === 'LONG' ? "text-emerald-500" : "text-rose-500")}>{direction}</span>
             </div>
             <div>
-              <span className="text-[10px] text-zinc-500 uppercase block">Risk</span>
-              <span className="font-bold text-rose-500">-${results.riskAmount.toFixed(2)}</span>
+              <span className="text-[10px] text-zinc-500 uppercase block">Entry</span>
+              <span className="font-bold text-zinc-100">${entryPrice.toFixed(4)}</span>
             </div>
             <div>
-              <span className="text-[10px] text-zinc-500 uppercase block">Planned RR</span>
-              <span className="font-bold text-blue-500">{results.plannedRR.toFixed(2)}</span>
+              <span className="text-[10px] text-zinc-500 uppercase block">Stop Loss</span>
+              <span className="font-bold text-rose-500">${stopLoss.toFixed(4)}</span>
+            </div>
+            <div>
+              <span className="text-[10px] text-zinc-500 uppercase block">Take Profit</span>
+              <span className="font-bold text-emerald-500">${takeProfit > 0 ? takeProfit.toFixed(4) : 'N/A'}</span>
+            </div>
+            <div>
+              <span className="text-[10px] text-zinc-500 uppercase block">Risk Amount</span>
+              <span className="font-bold text-rose-500">-${results.riskAmount.toFixed(2)}</span>
             </div>
           </div>
 
@@ -1569,6 +1627,31 @@ const LogTradeModal = ({ results, symbol, direction, leverage, entryPrice, stopL
             </div>
           </div>
 
+          <div className="flex flex-col gap-3 p-4 bg-amber-500/5 border border-amber-500/20 rounded-xl">
+            <div className="flex items-start gap-3">
+              <AlertTriangle className="w-4 h-4 text-amber-500 shrink-0 mt-0.5" />
+              <div className="space-y-1">
+                <p className="text-xs font-bold text-amber-500 uppercase tracking-wider">Final Review Required</p>
+                <p className="text-[11px] text-zinc-400 leading-relaxed">
+                  Please verify that your entry price, stop loss, and risk amount are correct. 
+                  Once logged, these parameters define your trade's risk profile in the journal.
+                </p>
+              </div>
+            </div>
+            <div className="flex items-center gap-2 mt-1">
+              <input 
+                type="checkbox"
+                id="confirmTrade"
+                checked={isConfirmed}
+                onChange={(e) => setIsConfirmed(e.target.checked)}
+                className="w-4 h-4 accent-emerald-500 cursor-pointer"
+              />
+              <label htmlFor="confirmTrade" className="text-xs font-medium text-zinc-300 cursor-pointer select-none">
+                I have reviewed the trade parameters and confirm they are accurate
+              </label>
+            </div>
+          </div>
+
           <div className="flex items-center gap-2">
             <input 
               type="checkbox"
@@ -1585,10 +1668,18 @@ const LogTradeModal = ({ results, symbol, direction, leverage, entryPrice, stopL
           <button onClick={onClose} className="btn-secondary flex-1">Cancel</button>
           <button 
             onClick={handleSave}
-            disabled={!notes.trim()}
-            className="btn-primary flex-1 disabled:opacity-50"
+            disabled={!notes.trim() || !isConfirmed}
+            className="btn-primary flex-1 disabled:opacity-50 disabled:cursor-not-allowed group relative"
           >
-            Save Trade
+            <div className="flex items-center justify-center gap-2">
+              <ShieldCheck className="w-4 h-4" />
+              <span>Confirm & Save Trade</span>
+            </div>
+            {!isConfirmed && (
+              <div className="absolute -top-10 left-1/2 -translate-x-1/2 bg-zinc-800 text-zinc-200 text-[10px] py-1 px-2 rounded opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none whitespace-nowrap border border-zinc-700">
+                Check the confirmation box to save
+              </div>
+            )}
           </button>
         </div>
       </div>
@@ -1843,6 +1934,343 @@ const CloseTradeModal = ({ trade, onClose, onSave }: { trade: Trade, onClose: ()
   );
 };
 
+const EditTradeModal = ({ trade, onClose, onSave }: { trade: Trade, onClose: () => void, onSave: (updatedTrade: Trade) => void }) => {
+  const [strategy, setStrategy] = useState(trade.strategy);
+  const [timeframe, setTimeframe] = useState(trade.timeframe);
+  const [notes, setNotes] = useState(trade.notes);
+  const [emotion, setEmotion] = useState(trade.emotion);
+  const [marketCondition, setMarketCondition] = useState(trade.marketCondition);
+  const [tags, setTags] = useState<string[]>(trade.tags || []);
+  const [tagInput, setTagInput] = useState('');
+  const [screenshot, setScreenshot] = useState<string | null>(trade.screenshot || null);
+  
+  // For CLOSED trades
+  const [exitPrice, setExitPrice] = useState(trade.exitPrice?.toString() || '');
+  const [fees, setFees] = useState(trade.fees?.toString() || '0');
+  const [highestPrice, setHighestPrice] = useState(trade.highestPriceReached?.toString() || '');
+  const [lowestPrice, setLowestPrice] = useState(trade.lowestPriceReached?.toString() || '');
+  const [exitRationale, setExitRationale] = useState(trade.exitRationale || '');
+  const [postReflection, setPostReflection] = useState(trade.postTradeReflection || '');
+  const [followedPlan, setFollowedPlan] = useState<'YES' | 'PARTIAL' | 'NO'>(trade.followedPlan || 'YES');
+
+  const preview = useMemo(() => {
+    if (trade.status !== 'CLOSED') return null;
+    const exit = parseFloat(exitPrice);
+    if (isNaN(exit)) return null;
+    const totalFees = parseFloat(fees) || 0;
+    const high = parseFloat(highestPrice) || exit;
+    const low = parseFloat(lowestPrice) || exit;
+
+    return calculateTradeMetrics({
+      ...trade,
+      exitPrice: exit,
+      fees: totalFees,
+      highestPriceReached: high,
+      lowestPriceReached: low
+    });
+  }, [exitPrice, fees, highestPrice, lowestPrice, trade]);
+
+  const handleScreenshotChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      if (file.size > 2 * 1024 * 1024) {
+        alert("File size too large. Please upload an image smaller than 2MB.");
+        return;
+      }
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        setScreenshot(reader.result as string);
+      };
+      reader.readAsDataURL(file);
+    }
+  };
+
+  const handleAddTag = (tag: string) => {
+    const t = tag.trim();
+    if (t && !tags.includes(t)) {
+      setTags([...tags, t]);
+    }
+    setTagInput('');
+  };
+
+  const handleSave = () => {
+    let updatedTrade: Trade = {
+      ...trade,
+      strategy,
+      timeframe,
+      notes,
+      emotion,
+      marketCondition,
+      tags,
+      screenshot,
+    };
+
+    if (trade.status === 'CLOSED') {
+      const exit = parseFloat(exitPrice);
+      const totalFees = parseFloat(fees) || 0;
+      const high = parseFloat(highestPrice) || exit;
+      const low = parseFloat(lowestPrice) || exit;
+
+      const metrics = calculateTradeMetrics({
+        ...trade,
+        exitPrice: exit,
+        fees: totalFees,
+        highestPriceReached: high,
+        lowestPriceReached: low
+      });
+
+      if (metrics) {
+        const mfePercent = trade.direction === 'LONG'
+          ? ((high - trade.entryPrice) / trade.entryPrice) * 100
+          : ((trade.entryPrice - low) / trade.entryPrice) * 100;
+        
+        const maePercent = trade.direction === 'LONG'
+          ? ((trade.entryPrice - low) / trade.entryPrice) * 100
+          : ((high - trade.entryPrice) / trade.entryPrice) * 100;
+
+        updatedTrade = {
+          ...updatedTrade,
+          exitPrice: exit,
+          fees: totalFees,
+          highestPriceReached: high,
+          lowestPriceReached: low,
+          pnl: metrics.pnl,
+          netPnl: metrics.netPnl,
+          actualRR: metrics.actualRR,
+          exitEfficiency: metrics.exitEfficiency,
+          mfeUsdt: trade.direction === 'LONG' ? (high - trade.entryPrice) * trade.quantity : (trade.entryPrice - low) * trade.quantity,
+          maeUsdt: trade.direction === 'LONG' ? (trade.entryPrice - low) * trade.quantity : (high - trade.entryPrice) * trade.quantity,
+          mfePercent,
+          maePercent,
+          exitRationale,
+          postTradeReflection: postReflection,
+          followedPlan,
+        };
+      }
+    }
+
+    onSave(updatedTrade);
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-zinc-950/80 backdrop-blur-sm">
+      <div className="bg-zinc-900 border border-zinc-800 rounded-2xl w-full max-w-2xl max-h-[90vh] overflow-y-auto shadow-2xl">
+        <div className="p-6 border-b border-zinc-800 flex items-center justify-between sticky top-0 bg-zinc-900 z-10">
+          <h2 className="text-xl font-bold flex items-center gap-2">
+            <Edit3 className="w-5 h-5 text-blue-500" />
+            Edit Trade: {trade.symbol}
+          </h2>
+          <button onClick={onClose} className="text-zinc-500 hover:text-zinc-100">
+            <RefreshCw className="w-5 h-5 rotate-45" />
+          </button>
+        </div>
+
+        <div className="p-6 space-y-6">
+          {preview && (
+            <div className="grid grid-cols-3 gap-4 p-4 bg-blue-500/5 border border-blue-500/20 rounded-xl">
+              <div className="text-center">
+                <span className="text-[10px] text-zinc-500 uppercase font-bold block mb-1">New Net PNL</span>
+                <div className={cn("text-lg font-mono font-bold", preview.netPnl >= 0 ? "text-emerald-500" : "text-rose-500")}>
+                  {preview.netPnl >= 0 ? '+' : ''}${preview.netPnl.toFixed(2)}
+                </div>
+              </div>
+              <div className="text-center border-x border-zinc-800">
+                <span className="text-[10px] text-zinc-500 uppercase font-bold block mb-1">New RR</span>
+                <div className={cn("text-lg font-mono font-bold", preview.actualRR >= 0 ? "text-blue-500" : "text-rose-500")}>
+                  {preview.actualRR.toFixed(2)}R
+                </div>
+              </div>
+              <div className="text-center">
+                <span className="text-[10px] text-zinc-500 uppercase font-bold block mb-1">New Efficiency</span>
+                <div className="text-lg font-mono font-bold text-amber-500">
+                  {preview.exitEfficiency.toFixed(1)}%
+                </div>
+              </div>
+            </div>
+          )}
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+            <div className="space-y-4">
+              <div className="space-y-2">
+                <label className="text-xs font-semibold text-zinc-500 uppercase">Strategy</label>
+                <select 
+                  value={strategy}
+                  onChange={(e) => setStrategy(e.target.value)}
+                  className="input-field w-full"
+                >
+                  {STRATEGIES.map(s => <option key={s} value={s}>{s}</option>)}
+                </select>
+              </div>
+              <div className="space-y-2">
+                <label className="text-xs font-semibold text-zinc-500 uppercase">Timeframe</label>
+                <select 
+                  value={timeframe}
+                  onChange={(e) => setTimeframe(e.target.value)}
+                  className="input-field w-full"
+                >
+                  {TIMEFRAMES.map(t => <option key={t} value={t}>{t}</option>)}
+                </select>
+              </div>
+              <div className="space-y-2">
+                <label className="text-xs font-semibold text-zinc-500 uppercase">Emotion</label>
+                <select 
+                  value={emotion}
+                  onChange={(e) => setEmotion(e.target.value)}
+                  className="input-field w-full"
+                >
+                  {EMOTIONS.map(e => <option key={e} value={e}>{e}</option>)}
+                </select>
+              </div>
+            </div>
+
+            <div className="space-y-4">
+              <div className="space-y-2">
+                <label className="text-xs font-semibold text-zinc-500 uppercase">Market Condition</label>
+                <select 
+                  value={marketCondition}
+                  onChange={(e) => setMarketCondition(e.target.value)}
+                  className="input-field w-full"
+                >
+                  {MARKET_CONDITIONS.map(m => <option key={m} value={m}>{m}</option>)}
+                </select>
+              </div>
+              <div className="space-y-2">
+                <label className="text-xs font-semibold text-zinc-500 uppercase">Tags</label>
+                <div className="flex flex-wrap gap-2 mb-2">
+                  {tags.map(t => (
+                    <span key={t} className="bg-emerald-500/10 text-emerald-500 px-2 py-0.5 rounded text-[10px] flex items-center gap-1">
+                      {t}
+                      <button onClick={() => setTags(tags.filter(tag => tag !== t))}><Trash2 className="w-3 h-3" /></button>
+                    </span>
+                  ))}
+                </div>
+                <input 
+                  value={tagInput}
+                  onChange={(e) => setTagInput(e.target.value)}
+                  onKeyDown={(e) => e.key === 'Enter' && handleAddTag(tagInput)}
+                  className="input-field w-full"
+                  placeholder="Add tag..."
+                />
+              </div>
+            </div>
+          </div>
+
+          {trade.status === 'CLOSED' && (
+            <div className="space-y-6 pt-6 border-t border-zinc-800">
+              <h3 className="text-sm font-bold text-zinc-400 uppercase tracking-wider">Closed Trade Details</h3>
+              <div className="grid grid-cols-2 gap-4">
+                <div className="space-y-2">
+                  <label className="text-xs font-semibold text-zinc-500 uppercase">Exit Price (USDT)</label>
+                  <input 
+                    type="number"
+                    value={exitPrice}
+                    onChange={(e) => setExitPrice(e.target.value)}
+                    className="input-field w-full font-mono"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <label className="text-xs font-semibold text-zinc-500 uppercase">Fees (USDT)</label>
+                  <input 
+                    type="number"
+                    value={fees}
+                    onChange={(e) => setFees(e.target.value)}
+                    className="input-field w-full font-mono"
+                  />
+                </div>
+              </div>
+              <div className="grid grid-cols-2 gap-4">
+                <div className="space-y-2">
+                  <label className="text-xs font-semibold text-zinc-500 uppercase">Highest Price Reached</label>
+                  <input 
+                    type="number"
+                    value={highestPrice}
+                    onChange={(e) => setHighestPrice(e.target.value)}
+                    className="input-field w-full font-mono"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <label className="text-xs font-semibold text-zinc-500 uppercase">Lowest Price Reached</label>
+                  <input 
+                    type="number"
+                    value={lowestPrice}
+                    onChange={(e) => setLowestPrice(e.target.value)}
+                    className="input-field w-full font-mono"
+                  />
+                </div>
+              </div>
+              <div className="space-y-2">
+                <label className="text-xs font-semibold text-zinc-500 uppercase">Followed Plan?</label>
+                <select 
+                  value={followedPlan}
+                  onChange={(e) => setFollowedPlan(e.target.value as any)}
+                  className="input-field w-full"
+                >
+                  <option value="YES">Yes</option>
+                  <option value="PARTIAL">Partial</option>
+                  <option value="NO">No</option>
+                </select>
+              </div>
+              <div className="space-y-2">
+                <label className="text-xs font-semibold text-zinc-500 uppercase">Exit Rationale</label>
+                <textarea 
+                  value={exitRationale}
+                  onChange={(e) => setExitRationale(e.target.value)}
+                  className="input-field w-full h-20 resize-none"
+                />
+              </div>
+              <div className="space-y-2">
+                <label className="text-xs font-semibold text-zinc-500 uppercase">Post-Trade Reflection</label>
+                <textarea 
+                  value={postReflection}
+                  onChange={(e) => setPostReflection(e.target.value)}
+                  className="input-field w-full h-20 resize-none"
+                />
+              </div>
+            </div>
+          )}
+
+          <div className="space-y-2 pt-6 border-t border-zinc-800">
+            <label className="text-xs font-semibold text-zinc-500 uppercase">Trade Notes</label>
+            <textarea 
+              value={notes}
+              onChange={(e) => setNotes(e.target.value)}
+              className="input-field w-full h-24 resize-none"
+            />
+          </div>
+
+          <div className="space-y-2">
+            <label className="text-xs font-semibold text-zinc-500 uppercase">Screenshot</label>
+            <div className="flex items-center gap-4">
+              <label className="flex-1 cursor-pointer">
+                <div className="border-2 border-dashed border-zinc-800 rounded-xl p-4 hover:border-blue-500/50 transition-all flex flex-col items-center gap-2 bg-zinc-950/50">
+                  <Upload className="w-6 h-6 text-zinc-500" />
+                  <span className="text-xs text-zinc-400">Update screenshot</span>
+                </div>
+                <input type="file" className="hidden" accept="image/*" onChange={handleScreenshotChange} />
+              </label>
+              {screenshot && (
+                <div className="relative w-24 h-24 rounded-xl overflow-hidden border border-zinc-800 shrink-0">
+                  <img src={screenshot} alt="Preview" className="w-full h-full object-cover" />
+                  <button 
+                    onClick={() => setScreenshot(null)}
+                    className="absolute top-1 right-1 p-1 bg-rose-500 rounded-full text-white hover:bg-rose-600 transition-colors"
+                  >
+                    <Trash2 className="w-3 h-3" />
+                  </button>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+
+        <div className="p-6 border-t border-zinc-800 flex gap-4 sticky bottom-0 bg-zinc-900">
+          <button onClick={onClose} className="btn-secondary flex-1">Cancel</button>
+          <button onClick={handleSave} className="btn-primary flex-1">Save Changes</button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
 const JournalTab = ({ 
   trades, 
   setTrades, 
@@ -1853,6 +2281,8 @@ const JournalTab = ({
   onDeleteTrade,
   onUpdateTrade,
   setDeletingTradeId,
+  editingTrade,
+  setEditingTrade,
   exportData, 
   importData, 
   clearData 
@@ -2429,6 +2859,17 @@ const JournalTab = ({
         />
       )}
 
+      {editingTrade && (
+        <EditTradeModal 
+          trade={editingTrade}
+          onClose={() => setEditingTrade(null)}
+          onSave={(updatedTrade) => {
+            onUpdateTrade(updatedTrade);
+            setEditingTrade(null);
+          }}
+        />
+      )}
+
       {/* Filters & Bulk Actions */}
       <div className="space-y-4">
         <div className="flex flex-col md:flex-row gap-4 items-center justify-between">
@@ -2680,6 +3121,13 @@ const JournalTab = ({
                           <CheckCircle2 className="w-4 h-4" />
                         </button>
                       )}
+                      <button 
+                        onClick={() => setEditingTrade(t)}
+                        className="text-zinc-500 hover:text-blue-500 transition-colors"
+                        title="Edit Trade"
+                      >
+                        <Edit3 className="w-4 h-4" />
+                      </button>
                       <button 
                         onClick={() => setReviewTrade(t)}
                         className="text-zinc-500 hover:text-zinc-100 transition-colors"
