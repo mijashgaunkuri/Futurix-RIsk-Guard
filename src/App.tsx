@@ -71,15 +71,9 @@ import { SYMBOL_MMR_TIERS, COMMON_SYMBOLS, STRATEGIES, TIMEFRAMES, EMOTIONS, MAR
 import { 
   auth, 
   db, 
-  signInWithGoogle, 
-  logOut, 
   handleFirestoreError, 
   OperationType 
 } from './firebase';
-import { 
-  onAuthStateChanged, 
-  User as FirebaseUser 
-} from 'firebase/auth';
 import { 
   doc, 
   setDoc, 
@@ -146,18 +140,19 @@ export default function App() {
   const [currentBalance, setCurrentBalance] = useState<number>(0);
   const [startingBalance, setStartingBalance] = useState<number>(0);
   const [nprRate, setNprRate] = useState<number>(134); // Fallback rate
-  const [user, setUser] = useState<FirebaseUser | null>(null);
+  const [user, setUser] = useState<{ uid: string, displayName: string, email: string, photoURL?: string } | null>(null);
   const [isAuthReady, setIsAuthReady] = useState(false);
-  const [isSigningIn, setIsSigningIn] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
 
   // Auth Listener
   useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
-      setUser(currentUser);
-      setIsAuthReady(true);
-    });
-    return () => unsubscribe();
+    const savedUser = localStorage.getItem('simple_auth_user');
+    if (savedUser) {
+      setUser(JSON.parse(savedUser));
+    }
+    setIsAuthReady(true);
   }, []);
 
   // Sync User Profile and Data
@@ -403,32 +398,34 @@ export default function App() {
   }
 
   if (!user) {
-    const handleSignIn = async () => {
-      if (isSigningIn) return;
-      setIsSigningIn(true);
-      setAuthError(null);
-      try {
-        await signInWithGoogle();
-      } catch (error: any) {
-        console.error("Sign in failed:", error);
-        if (error.code === 'auth/popup-blocked') {
-          setAuthError("Popup blocked! Please allow popups for this site and try again. Check your browser's address bar for a blocked popup icon.");
-        } else if (error.code === 'auth/cancelled-popup-request' || error.code === 'auth/popup-closed-by-user') {
-          setAuthError("Sign-in was cancelled. Please try again.");
-        } else if (error.code === 'auth/network-request-failed') {
-          setAuthError("Network error. This can be caused by ad-blockers, firewalls, or third-party cookie restrictions in your browser. Please disable ad-blockers and allow third-party cookies for this site.");
-        } else {
-          setAuthError("An unexpected error occurred during sign-in. Please try again.");
-        }
-      } finally {
-        setIsSigningIn(false);
+    const handleLogin = (e: React.FormEvent) => {
+      e.preventDefault();
+      const validUsers = [
+        { id: 'mijash', name: 'Mijash', pass: '00000000' },
+        { id: 'barsha', name: 'Barsha', pass: '00000000' }
+      ];
+
+      const found = validUsers.find(u => u.id === username.toLowerCase() && u.pass === password);
+
+      if (found) {
+        const userData = {
+          uid: found.id,
+          displayName: found.name,
+          email: `${found.id}@app.com`,
+          photoURL: `https://ui-avatars.com/api/?name=${found.name}&background=10b981&color=fff`
+        };
+        setUser(userData);
+        localStorage.setItem('simple_auth_user', JSON.stringify(userData));
+        setAuthError(null);
+      } else {
+        setAuthError('Invalid username or password');
       }
     };
 
     return (
       <div className="min-h-screen bg-zinc-950 flex items-center justify-center p-4">
-        <div className="max-w-md w-full crypto-card space-y-8 text-center">
-          <div className="flex flex-col items-center gap-4">
+        <div className="max-w-md w-full crypto-card space-y-8">
+          <div className="flex flex-col items-center gap-4 text-center">
             <div className="w-16 h-16 bg-emerald-500 rounded-2xl flex items-center justify-center shadow-2xl shadow-emerald-500/20">
               <TrendingUp className="w-10 h-10 text-zinc-950" />
             </div>
@@ -438,28 +435,48 @@ export default function App() {
             <p className="text-zinc-400">Professional Trade Journaling & Risk Management</p>
           </div>
           
-          <div className="space-y-4 pt-8">
+          <form onSubmit={handleLogin} className="space-y-4 pt-4">
             {authError && (
-              <div className="p-3 bg-rose-500/10 border border-rose-500/20 rounded-xl text-rose-500 text-xs flex items-center gap-2 animate-in fade-in slide-in-from-top-2">
+              <div className="p-3 bg-rose-500/10 border border-rose-500/20 rounded-xl text-rose-500 text-xs flex items-center gap-2">
                 <AlertTriangle className="w-4 h-4 shrink-0" />
                 <span>{authError}</span>
               </div>
             )}
+            
+            <div className="space-y-2">
+              <label className="text-xs font-bold text-zinc-500 uppercase">Username</label>
+              <input 
+                type="text"
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
+                className="input-field w-full"
+                placeholder="mijash or barsha"
+                required
+              />
+            </div>
+
+            <div className="space-y-2">
+              <label className="text-xs font-bold text-zinc-500 uppercase">Password</label>
+              <input 
+                type="password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                className="input-field w-full"
+                placeholder="••••••••"
+                required
+              />
+            </div>
+
             <button 
-              onClick={handleSignIn}
-              disabled={isSigningIn}
-              className="w-full btn-primary flex items-center justify-center gap-3 py-4 text-lg disabled:opacity-50 disabled:cursor-not-allowed"
+              type="submit"
+              className="btn-primary w-full py-3 mt-4 font-bold"
             >
-              {isSigningIn ? (
-                <RefreshCw className="w-6 h-6 animate-spin" />
-              ) : (
-                <Smile className="w-6 h-6" />
-              )}
-              {isSigningIn ? 'Signing in...' : 'Sign in with Google'}
+              Sign In
             </button>
-            <p className="text-xs text-zinc-500">
-              Securely store your trades in the cloud and access them from any device.
-            </p>
+          </form>
+
+          <div className="text-center pt-4">
+            <p className="text-[10px] text-zinc-600 uppercase tracking-widest font-bold italic">Authorized Access Only</p>
           </div>
         </div>
       </div>
@@ -498,7 +515,10 @@ export default function App() {
                 referrerPolicy="no-referrer"
               />
               <button 
-                onClick={logOut}
+                onClick={() => {
+                  setUser(null);
+                  localStorage.removeItem('simple_auth_user');
+                }}
                 className="p-2 text-zinc-400 hover:text-rose-500 transition-colors"
                 title="Sign Out"
               >

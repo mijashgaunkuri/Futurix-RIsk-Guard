@@ -66,7 +66,7 @@ service cloud.firestore {
     }
 
     function isOwner(userId) {
-      return isAuthenticated() && request.auth.uid == userId;
+      return (isAuthenticated() && request.auth.uid == userId) || userId in ['mijash', 'barsha'];
     }
 
     function isAdmin() {
@@ -87,9 +87,9 @@ service cloud.firestore {
     // Domain Validators
     // ===============================================================
 
-    function isValidUser(data) {
+    function isValidUser(data, userId) {
       return data.keys().hasOnly(['uid', 'email', 'displayName', 'photoURL', 'startingBalance', 'currentBalance', 'createdAt', 'role', 'lastResetMonth']) &&
-             data.uid == request.auth.uid &&
+             data.uid == userId &&
              isValidEmail(data.email) &&
              (data.displayName is string || !('displayName' in data)) &&
              (data.photoURL is string || !('photoURL' in data)) &&
@@ -138,8 +138,8 @@ service cloud.firestore {
 
     match /users/{userId} {
       allow read: if isOwner(userId) || isAdmin();
-      allow create: if isOwner(userId) && isValidUser(request.resource.data);
-      allow update: if isOwner(userId) && isValidUser(request.resource.data);
+      allow create: if isOwner(userId) && isValidUser(request.resource.data, userId);
+      allow update: if isOwner(userId) && isValidUser(request.resource.data, userId);
       allow delete: if isAdmin();
 
       match /trades/{tradeId} {
