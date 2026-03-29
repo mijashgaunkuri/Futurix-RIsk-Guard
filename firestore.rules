@@ -1,0 +1,165 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // ===============================================================
+    // Assumed Data Model
+    // ===============================================================
+    //
+    // Collection: users
+    // Document ID: {userId} (Firebase Auth UID)
+    // Fields:
+    //   - uid: string (required) - Auth UID
+    //   - email: string (required, email format) - User's email
+    //   - displayName: string (optional) - User's display name
+    //   - photoURL: string (optional) - User's photo URL
+    //   - startingBalance: number (optional) - Initial balance
+    //   - currentBalance: number (optional) - Current balance
+    //   - createdAt: string (optional, date-time) - Creation timestamp
+    //
+    // Subcollection: users/{userId}/trades
+    // Document ID: {tradeId}
+    // Fields:
+    //   - id: string (required)
+    //   - symbol: string (required)
+    //   - direction: string (required, enum: LONG, SHORT)
+    //   - entryPrice: number (required)
+    //   - stopLoss: number (required)
+    //   - takeProfit: number (optional)
+    //   - leverage: number (optional)
+    //   - riskPercent: number (optional)
+    //   - riskAmount: number (optional)
+    //   - quantity: number (optional)
+    //   - notionalValue: number (optional)
+    //   - initialMargin: number (optional)
+    //   - pnlAtSL: number (optional)
+    //   - pnlAtTP: number (optional)
+    //   - plannedRR: number (optional)
+    //   - status: string (required, enum: OPEN, WON, LOST, CANCELLED)
+    //   - exitPrice: number (optional)
+    //   - pnl: number (optional)
+    //   - notes: string (optional)
+    //   - tags: list (optional)
+    //   - strategy: string (optional)
+    //   - timeframe: string (optional)
+    //   - emotion: string (optional)
+    //   - marketCondition: string (optional)
+    //   - date: string (required, date-time)
+    //   - closedAt: string (optional, date-time)
+    //
+    // Subcollection: users/{userId}/balanceHistory
+    // Document ID: {historyId}
+    // Fields:
+    //   - id: string (required)
+    //   - date: string (required, date-time)
+    //   - amount: number (required)
+    //   - type: string (required, enum: DEPOSIT, WITHDRAWAL, TRADE)
+    //   - note: string (optional)
+    //
+    // ===============================================================
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+    
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isAdmin() {
+      return isAuthenticated() &&
+        (get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin' ||
+          (request.auth.token.email == "Mijashchhetri1011@gmail.com" && request.auth.token.email_verified == true));
+    }
+
+    function isValidEmail(email) {
+      return email is string && email.matches("^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$");
+    }
+
+    function isValidDateString(dateStr) {
+      return dateStr is string && dateStr.matches("^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}.*Z?$");
+    }
+
+    // ===============================================================
+    // Domain Validators
+    // ===============================================================
+
+    function isValidUser(data) {
+      return data.keys().hasOnly(['uid', 'email', 'displayName', 'photoURL', 'startingBalance', 'currentBalance', 'createdAt', 'role', 'lastResetMonth']) &&
+             data.uid == request.auth.uid &&
+             isValidEmail(data.email) &&
+             (data.displayName is string || !('displayName' in data)) &&
+             (data.photoURL is string || !('photoURL' in data)) &&
+             (data.startingBalance is number || !('startingBalance' in data)) &&
+             (data.currentBalance is number || !('currentBalance' in data)) &&
+             (data.role is string || !('role' in data)) &&
+             (data.lastResetMonth is string || !('lastResetMonth' in data));
+    }
+
+    function isValidTrade(data) {
+      return data.keys().hasAll(['id', 'symbol', 'direction', 'entryPrice', 'stopLoss', 'date', 'status']) &&
+             data.keys().hasOnly([
+               'id', 'date', 'symbol', 'direction', 'leverage', 'entryPrice', 'expectedEntryPrice', 
+               'stopLoss', 'takeProfit', 'exitPrice', 'quantity', 'notionalValue', 'initialMargin', 
+               'maintenanceMargin', 'liquidationPrice', 'riskAmount', 'pnl', 'fees', 'netPnl', 
+               'strategy', 'timeframe', 'notes', 'emotion', 'postTradeReflection', 'exitRationale', 
+               'marketCondition', 'tags', 'status', 'plannedRR', 'actualRR', 'balanceBefore', 
+               'balanceAfter', 'highestPriceReached', 'lowestPriceReached', 'mfeUsdt', 'maeUsdt', 
+               'mfePercent', 'maePercent', 'exitEfficiency', 'isBreakevenMoved', 'partialExitsCount', 
+               'isRevengeTrade', 'followedPlan', 'safetyBufferAtEntry', 'liqDistAtEntry', 
+               'durationMinutes', 'screenshot', 'riskPercent', 'pnlAtSL', 'pnlAtTP', 'closedAt'
+             ]) &&
+             data.id is string &&
+             data.symbol is string &&
+             data.direction in ['LONG', 'SHORT'] &&
+             data.entryPrice is number &&
+             data.stopLoss is number &&
+             isValidDateString(data.date) &&
+             data.status in ['OPEN', 'CLOSED', 'WON', 'LOST', 'CANCELLED'] &&
+             (data.tags is list || !('tags' in data)) &&
+             (data.leverage is number || !('leverage' in data)) &&
+             (data.pnl is number || !('pnl' in data));
+    }
+
+    function isValidBalanceHistory(data) {
+      return data.keys().hasAll(['id', 'date', 'amount', 'type']) &&
+             data.id is string &&
+             isValidDateString(data.date) &&
+             data.amount is number &&
+             data.type in ['DEPOSIT', 'WITHDRAWAL', 'TRADE'];
+    }
+
+    // ===============================================================
+    // Rules
+    // ===============================================================
+
+    match /users/{userId} {
+      allow read: if isOwner(userId) || isAdmin();
+      allow create: if isOwner(userId) && isValidUser(request.resource.data);
+      allow update: if isOwner(userId) && isValidUser(request.resource.data);
+      allow delete: if isAdmin();
+
+      match /trades/{tradeId} {
+        allow read: if isOwner(userId) || isAdmin();
+        allow create: if isOwner(userId) && isValidTrade(request.resource.data);
+        allow update: if isOwner(userId) && isValidTrade(request.resource.data);
+        allow delete: if isOwner(userId) || isAdmin();
+      }
+
+      match /balanceHistory/{historyId} {
+        allow read: if isOwner(userId) || isAdmin();
+        allow create: if isOwner(userId) && isValidBalanceHistory(request.resource.data);
+        allow update: if isOwner(userId) && isValidBalanceHistory(request.resource.data);
+        allow delete: if isAdmin();
+      }
+    }
+
+    // Default deny
+    match /{path=**} {
+      allow read, write: if false;
+    }
+  }
+}
