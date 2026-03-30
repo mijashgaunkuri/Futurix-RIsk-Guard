@@ -71,9 +71,15 @@ import { SYMBOL_MMR_TIERS, COMMON_SYMBOLS, STRATEGIES, TIMEFRAMES, EMOTIONS, MAR
 import { 
   auth, 
   db, 
+  signInWithGoogle, 
+  logOut, 
   handleFirestoreError, 
   OperationType 
 } from './firebase';
+import { 
+  onAuthStateChanged,
+  User as FirebaseUser
+} from 'firebase/auth';
 import { 
   doc, 
   setDoc, 
@@ -134,25 +140,22 @@ const calculateTradeMetrics = (trade: Partial<Trade> & { entryPrice: number, sto
 };
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<'calculator' | 'journal' | 'stats'>('calculator');
+  const [activeTab, setActiveTab] = useState<'calculator' | 'journal' | 'stats' | 'settings'>('calculator');
   const [trades, setTrades] = useState<Trade[]>([]);
   const [balanceHistory, setBalanceHistory] = useState<BalanceHistory[]>([]);
   const [currentBalance, setCurrentBalance] = useState<number>(0);
   const [startingBalance, setStartingBalance] = useState<number>(0);
   const [nprRate, setNprRate] = useState<number>(134); // Fallback rate
-  const [user, setUser] = useState<{ uid: string, displayName: string, email: string, photoURL?: string } | null>(null);
+  const [user, setUser] = useState<FirebaseUser | null>(null);
   const [isAuthReady, setIsAuthReady] = useState(false);
-  const [authError, setAuthError] = useState<string | null>(null);
-  const [username, setUsername] = useState('');
-  const [password, setPassword] = useState('');
 
   // Auth Listener
   useEffect(() => {
-    const savedUser = localStorage.getItem('simple_auth_user');
-    if (savedUser) {
-      setUser(JSON.parse(savedUser));
-    }
-    setIsAuthReady(true);
+    const unsubscribe = onAuthStateChanged(auth, (u) => {
+      setUser(u);
+      setIsAuthReady(true);
+    });
+    return () => unsubscribe();
   }, []);
 
   // Sync User Profile and Data
@@ -188,6 +191,20 @@ export default function App() {
 
         setStartingBalance(sBalance);
         setCurrentBalance(data.currentBalance || 0);
+      } else {
+        // Create user document if it doesn't exist
+        const initialUser = {
+          uid: user.uid,
+          email: user.email,
+          displayName: user.displayName,
+          photoURL: user.photoURL,
+          startingBalance: 0,
+          currentBalance: 0,
+          createdAt: new Date().toISOString(),
+          role: 'user',
+          lastResetMonth: `${new Date().getFullYear()}-${new Date().getMonth()}`
+        };
+        setDoc(userDocRef, initialUser);
       }
     }, (error) => {
       handleFirestoreError(error, OperationType.GET, `users/${user.uid}`);
@@ -345,7 +362,7 @@ export default function App() {
         if (data.startingBalance !== undefined) {
           batch.update(doc(db, 'users', user.uid), { 
             startingBalance: data.startingBalance,
-            currentBalance: data.balanceHistory?.[data.balanceHistory.length - 1]?.amount || data.startingBalance
+            currentBalance: data.balanceHistory?.[data.balanceHistory.length - 1]?.balanceAfter || data.startingBalance
           });
         }
         
@@ -398,30 +415,6 @@ export default function App() {
   }
 
   if (!user) {
-    const handleLogin = (e: React.FormEvent) => {
-      e.preventDefault();
-      const validUsers = [
-        { id: 'mijash', name: 'Mijash', pass: '00000000' },
-        { id: 'barsha', name: 'Barsha', pass: '00000000' }
-      ];
-
-      const found = validUsers.find(u => u.id === username.toLowerCase() && u.pass === password);
-
-      if (found) {
-        const userData = {
-          uid: found.id,
-          displayName: found.name,
-          email: `${found.id}@app.com`,
-          photoURL: `https://ui-avatars.com/api/?name=${found.name}&background=10b981&color=fff`
-        };
-        setUser(userData);
-        localStorage.setItem('simple_auth_user', JSON.stringify(userData));
-        setAuthError(null);
-      } else {
-        setAuthError('Invalid username or password');
-      }
-    };
-
     return (
       <div className="min-h-screen bg-zinc-950 flex items-center justify-center p-4">
         <div className="max-w-md w-full crypto-card space-y-8">
@@ -435,48 +428,18 @@ export default function App() {
             <p className="text-zinc-400">Professional Trade Journaling & Risk Management</p>
           </div>
           
-          <form onSubmit={handleLogin} className="space-y-4 pt-4">
-            {authError && (
-              <div className="p-3 bg-rose-500/10 border border-rose-500/20 rounded-xl text-rose-500 text-xs flex items-center gap-2">
-                <AlertTriangle className="w-4 h-4 shrink-0" />
-                <span>{authError}</span>
-              </div>
-            )}
-            
-            <div className="space-y-2">
-              <label className="text-xs font-bold text-zinc-500 uppercase">Username</label>
-              <input 
-                type="text"
-                value={username}
-                onChange={(e) => setUsername(e.target.value)}
-                className="input-field w-full"
-                placeholder="mijash or barsha"
-                required
-              />
-            </div>
-
-            <div className="space-y-2">
-              <label className="text-xs font-bold text-zinc-500 uppercase">Password</label>
-              <input 
-                type="password"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                className="input-field w-full"
-                placeholder="••••••••"
-                required
-              />
-            </div>
-
+          <div className="space-y-4 pt-4">
             <button 
-              type="submit"
-              className="btn-primary w-full py-3 mt-4 font-bold"
+              onClick={signInWithGoogle}
+              className="w-full flex items-center justify-center gap-3 bg-white text-zinc-900 py-3 px-4 rounded-xl font-bold hover:bg-zinc-100 transition-all active:scale-[0.98]"
             >
-              Sign In
+              <img src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/auth/google.svg" className="w-5 h-5" alt="Google" />
+              Sign in with Google
             </button>
-          </form>
+          </div>
 
           <div className="text-center pt-4">
-            <p className="text-[10px] text-zinc-600 uppercase tracking-widest font-bold italic">Authorized Access Only</p>
+            <p className="text-[10px] text-zinc-600 uppercase tracking-widest font-bold italic">Secure Cloud Sync Enabled</p>
           </div>
         </div>
       </div>
@@ -515,10 +478,7 @@ export default function App() {
                 referrerPolicy="no-referrer"
               />
               <button 
-                onClick={() => {
-                  setUser(null);
-                  localStorage.removeItem('simple_auth_user');
-                }}
+                onClick={logOut}
                 className="p-2 text-zinc-400 hover:text-rose-500 transition-colors"
                 title="Sign Out"
               >

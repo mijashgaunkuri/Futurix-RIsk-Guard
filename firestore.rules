@@ -6,54 +6,39 @@ service cloud.firestore {
     // ===============================================================
     //
     // Collection: users
-    // Document ID: {userId} (Firebase Auth UID)
+    // Document ID: {userId}
     // Fields:
-    //   - uid: string (required) - Auth UID
-    //   - email: string (required, email format) - User's email
-    //   - displayName: string (optional) - User's display name
+    //   - uid: string (required) - User's unique ID
+    //   - email: string (required) - User's email
+    //   - displayName: string (required) - User's display name
     //   - photoURL: string (optional) - User's photo URL
-    //   - startingBalance: number (optional) - Initial balance
-    //   - currentBalance: number (optional) - Current balance
-    //   - createdAt: string (optional, date-time) - Creation timestamp
+    //   - startingBalance: number (required) - User's starting balance for the month
+    //   - currentBalance: number (required) - User's current balance
+    //   - createdAt: timestamp (required) - Account creation date
+    //   - role: string (required) - User's role (e.g., 'user')
+    //   - lastResetMonth: string (required) - Last month the balance was reset (e.g., '2026-3')
     //
-    // Subcollection: users/{userId}/trades
+    // Sub-collection: users/{userId}/trades
     // Document ID: {tradeId}
     // Fields:
     //   - id: string (required)
     //   - symbol: string (required)
-    //   - direction: string (required, enum: LONG, SHORT)
     //   - entryPrice: number (required)
     //   - stopLoss: number (required)
-    //   - takeProfit: number (optional)
-    //   - leverage: number (optional)
-    //   - riskPercent: number (optional)
-    //   - riskAmount: number (optional)
-    //   - quantity: number (optional)
-    //   - notionalValue: number (optional)
-    //   - initialMargin: number (optional)
-    //   - pnlAtSL: number (optional)
-    //   - pnlAtTP: number (optional)
-    //   - plannedRR: number (optional)
-    //   - status: string (required, enum: OPEN, WON, LOST, CANCELLED)
-    //   - exitPrice: number (optional)
-    //   - pnl: number (optional)
-    //   - notes: string (optional)
-    //   - tags: list (optional)
-    //   - strategy: string (optional)
-    //   - timeframe: string (optional)
-    //   - emotion: string (optional)
-    //   - marketCondition: string (optional)
-    //   - date: string (required, date-time)
-    //   - closedAt: string (optional, date-time)
+    //   - quantity: number (required)
+    //   - direction: string (required)
+    //   - status: string (required)
+    //   - date: string (required)
+    //   [... other trade fields]
     //
-    // Subcollection: users/{userId}/balanceHistory
+    // Sub-collection: users/{userId}/balanceHistory
     // Document ID: {historyId}
     // Fields:
     //   - id: string (required)
-    //   - date: string (required, date-time)
+    //   - date: string (required)
     //   - amount: number (required)
-    //   - type: string (required, enum: DEPOSIT, WITHDRAWAL, TRADE)
-    //   - note: string (optional)
+    //   - type: string (required)
+    //   - balanceAfter: number (required)
     //
     // ===============================================================
 
@@ -66,70 +51,38 @@ service cloud.firestore {
     }
 
     function isOwner(userId) {
-      return (isAuthenticated() && request.auth.uid == userId) || userId in ['mijash', 'barsha'];
+      return isAuthenticated() && request.auth.uid == userId;
     }
 
-    function isAdmin() {
-      return isAuthenticated() &&
-        (get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin' ||
-          (request.auth.token.email == "Mijashchhetri1011@gmail.com" && request.auth.token.email_verified == true));
-    }
-
-    function isValidEmail(email) {
-      return email is string && email.matches("^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$");
-    }
-
-    function isValidDateString(dateStr) {
-      return dateStr is string && dateStr.matches("^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}.*Z?$");
-    }
-
-    // ===============================================================
-    // Domain Validators
-    // ===============================================================
-
-    function isValidUser(data, userId) {
-      return data.keys().hasOnly(['uid', 'email', 'displayName', 'photoURL', 'startingBalance', 'currentBalance', 'createdAt', 'role', 'lastResetMonth']) &&
-             data.uid == userId &&
-             isValidEmail(data.email) &&
-             (data.displayName is string || !('displayName' in data)) &&
-             (data.photoURL is string || !('photoURL' in data)) &&
-             (data.startingBalance is number || !('startingBalance' in data)) &&
-             (data.currentBalance is number || !('currentBalance' in data)) &&
-             (data.role is string || !('role' in data)) &&
-             (data.lastResetMonth is string || !('lastResetMonth' in data));
+    function isValidUser(data) {
+      return data.keys().hasAll(['uid', 'email', 'displayName', 'startingBalance', 'currentBalance', 'createdAt', 'role', 'lastResetMonth']) &&
+             data.uid is string &&
+             data.email is string &&
+             data.displayName is string &&
+             data.startingBalance is number &&
+             data.currentBalance is number &&
+             data.role == 'user';
     }
 
     function isValidTrade(data) {
-      return data.keys().hasAll(['id', 'symbol', 'direction', 'entryPrice', 'stopLoss', 'date', 'status']) &&
-             data.keys().hasOnly([
-               'id', 'date', 'symbol', 'direction', 'leverage', 'entryPrice', 'expectedEntryPrice', 
-               'stopLoss', 'takeProfit', 'exitPrice', 'quantity', 'notionalValue', 'initialMargin', 
-               'maintenanceMargin', 'liquidationPrice', 'riskAmount', 'pnl', 'fees', 'netPnl', 
-               'strategy', 'timeframe', 'notes', 'emotion', 'postTradeReflection', 'exitRationale', 
-               'marketCondition', 'tags', 'status', 'plannedRR', 'actualRR', 'balanceBefore', 
-               'balanceAfter', 'highestPriceReached', 'lowestPriceReached', 'mfeUsdt', 'maeUsdt', 
-               'mfePercent', 'maePercent', 'exitEfficiency', 'isBreakevenMoved', 'partialExitsCount', 
-               'isRevengeTrade', 'followedPlan', 'safetyBufferAtEntry', 'liqDistAtEntry', 
-               'durationMinutes', 'screenshot', 'riskPercent', 'pnlAtSL', 'pnlAtTP', 'closedAt'
-             ]) &&
+      return data.keys().hasAll(['id', 'symbol', 'entryPrice', 'stopLoss', 'quantity', 'direction', 'status', 'date']) &&
              data.id is string &&
              data.symbol is string &&
-             data.direction in ['LONG', 'SHORT'] &&
              data.entryPrice is number &&
              data.stopLoss is number &&
-             isValidDateString(data.date) &&
-             data.status in ['OPEN', 'CLOSED', 'WON', 'LOST', 'CANCELLED'] &&
-             (data.tags is list || !('tags' in data)) &&
-             (data.leverage is number || !('leverage' in data)) &&
-             (data.pnl is number || !('pnl' in data));
+             data.quantity is number &&
+             data.direction in ['LONG', 'SHORT'] &&
+             data.status in ['OPEN', 'CLOSED'] &&
+             data.date is string;
     }
 
-    function isValidBalanceHistory(data) {
-      return data.keys().hasAll(['id', 'date', 'amount', 'type']) &&
+    function isValidHistory(data) {
+      return data.keys().hasAll(['id', 'date', 'amount', 'type', 'balanceAfter']) &&
              data.id is string &&
-             isValidDateString(data.date) &&
+             data.date is string &&
              data.amount is number &&
-             data.type in ['DEPOSIT', 'WITHDRAWAL', 'TRADE'];
+             data.type in ['DEPOSIT', 'WITHDRAWAL', 'TRADE', 'RESET'] &&
+             data.balanceAfter is number;
     }
 
     // ===============================================================
@@ -137,28 +90,27 @@ service cloud.firestore {
     // ===============================================================
 
     match /users/{userId} {
-      allow read: if isOwner(userId) || isAdmin();
-      allow create: if isOwner(userId) && isValidUser(request.resource.data, userId);
-      allow update: if isOwner(userId) && isValidUser(request.resource.data, userId);
-      allow delete: if isAdmin();
-
+      allow read: if isOwner(userId);
+      allow create: if isOwner(userId) && isValidUser(request.resource.data);
+      allow update: if isOwner(userId) && isValidUser(request.resource.data);
+      
       match /trades/{tradeId} {
-        allow read: if isOwner(userId) || isAdmin();
+        allow read: if isOwner(userId);
         allow create: if isOwner(userId) && isValidTrade(request.resource.data);
         allow update: if isOwner(userId) && isValidTrade(request.resource.data);
-        allow delete: if isOwner(userId) || isAdmin();
+        allow delete: if isOwner(userId);
       }
 
       match /balanceHistory/{historyId} {
-        allow read: if isOwner(userId) || isAdmin();
-        allow create: if isOwner(userId) && isValidBalanceHistory(request.resource.data);
-        allow update: if isOwner(userId) && isValidBalanceHistory(request.resource.data);
-        allow delete: if isAdmin();
+        allow read: if isOwner(userId);
+        allow create: if isOwner(userId) && isValidHistory(request.resource.data);
+        allow update: if isOwner(userId) && isValidHistory(request.resource.data);
+        allow delete: if isOwner(userId);
       }
     }
 
     // Default deny
-    match /{path=**} {
+    match /{document=**} {
       allow read, write: if false;
     }
   }

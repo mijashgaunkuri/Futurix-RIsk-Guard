@@ -2,100 +2,74 @@
   "entities": {
     "User": {
       "title": "User Profile",
-      "description": "Stores user-specific settings and profile information.",
+      "description": "User's profile and account information",
       "type": "object",
       "properties": {
-        "uid": { "type": "string", "description": "The unique Firebase Auth UID." },
-        "email": { "type": "string", "format": "email", "description": "User's email address." },
-        "displayName": { "type": "string", "description": "User's display name." },
-        "photoURL": { "type": "string", "description": "User's profile picture URL." },
-        "startingBalance": { "type": "number", "description": "The initial balance for the journal." },
-        "currentBalance": { "type": "number", "description": "The current balance after trades and deposits/withdrawals." },
-        "createdAt": { "type": "string", "format": "date-time", "description": "When the user account was first created in the app." }
+        "uid": { "type": "string", "description": "User's unique ID" },
+        "email": { "type": "string", "format": "email", "description": "User's email" },
+        "displayName": { "type": "string", "description": "User's display name" },
+        "photoURL": { "type": "string", "format": "uri", "description": "User's photo URL" },
+        "startingBalance": { "type": "number", "description": "User's starting balance for the month" },
+        "currentBalance": { "type": "number", "description": "User's current balance" },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Account creation date" },
+        "role": { "type": "string", "enum": ["user"], "description": "User's role" },
+        "lastResetMonth": { "type": "string", "description": "Last month the balance was reset (e.g., '2026-3')" }
       },
-      "required": ["uid", "email"]
+      "required": ["uid", "email", "displayName", "startingBalance", "currentBalance", "createdAt", "role", "lastResetMonth"]
     },
     "Trade": {
-      "title": "Trade Journal Entry",
-      "description": "Represents a single trade logged by the user.",
+      "title": "Trade Entry",
+      "description": "A single trade entry in the journal",
       "type": "object",
       "properties": {
-        "id": { "type": "string", "description": "Unique trade ID." },
-        "date": { "type": "string", "format": "date-time", "description": "When the trade was logged." },
-        "symbol": { "type": "string", "description": "Trading pair (e.g., BTCUSDT)." },
-        "direction": { "type": "string", "enum": ["LONG", "SHORT"], "description": "Trade direction." },
-        "leverage": { "type": "number", "description": "Leverage used." },
-        "entryPrice": { "type": "number", "description": "Price at which the trade was opened." },
-        "expectedEntryPrice": { "type": "number", "description": "Expected entry price." },
-        "stopLoss": { "type": "number", "description": "Stop loss price." },
-        "takeProfit": { "type": "number", "description": "Take profit price." },
-        "exitPrice": { "type": "number", "description": "Price at which the trade was closed." },
-        "quantity": { "type": "number", "description": "Calculated position quantity." },
-        "notionalValue": { "type": "number", "description": "Total notional value of the position." },
-        "initialMargin": { "type": "number", "description": "Initial margin required." },
-        "maintenanceMargin": { "type": "number", "description": "Maintenance margin required." },
-        "liquidationPrice": { "type": "number", "description": "Liquidation price." },
-        "riskAmount": { "type": "number", "description": "Calculated risk amount in USDT." },
-        "pnl": { "type": "number", "description": "Actual PNL realized." },
-        "fees": { "type": "number", "description": "Trading fees." },
-        "netPnl": { "type": "number", "description": "Net PNL after fees." },
-        "strategy": { "type": "string", "description": "Strategy used." },
-        "timeframe": { "type": "string", "description": "Timeframe of the trade." },
-        "notes": { "type": "string", "description": "User notes for the trade." },
-        "emotion": { "type": "string", "description": "User's emotion during the trade." },
-        "postTradeReflection": { "type": "string", "description": "Reflection after the trade." },
-        "exitRationale": { "type": "string", "description": "Reason for exiting the trade." },
-        "marketCondition": { "type": "string", "description": "Market condition during the trade." },
-        "tags": { "type": "array", "items": { "type": "string" }, "description": "Tags for categorization." },
-        "status": { "type": "string", "enum": ["OPEN", "CLOSED"], "description": "Current status of the trade." },
-        "plannedRR": { "type": "number", "description": "Planned Risk/Reward ratio." },
-        "actualRR": { "type": "number", "description": "Actual Risk/Reward ratio." },
-        "balanceBefore": { "type": "number", "description": "Balance before the trade." },
-        "balanceAfter": { "type": "number", "description": "Balance after the trade." },
-        "highestPriceReached": { "type": "number", "description": "Highest price reached during trade." },
-        "lowestPriceReached": { "type": "number", "description": "Lowest price reached during trade." },
-        "mfeUsdt": { "type": "number", "description": "Maximum Favorable Excursion in USDT." },
-        "maeUsdt": { "type": "number", "description": "Maximum Adverse Excursion in USDT." },
-        "mfePercent": { "type": "number", "description": "Maximum Favorable Excursion in percent." },
-        "maePercent": { "type": "number", "description": "Maximum Adverse Excursion in percent." },
-        "exitEfficiency": { "type": "number", "description": "Exit efficiency percentage." },
-        "isBreakevenMoved": { "type": "boolean", "description": "Whether stop loss was moved to breakeven." },
-        "partialExitsCount": { "type": "integer", "description": "Number of partial exits taken." },
-        "isRevengeTrade": { "type": "boolean", "description": "Whether this was a revenge trade." },
-        "followedPlan": { "type": "string", "enum": ["YES", "PARTIAL", "NO"], "description": "Whether the trade plan was followed." },
-        "safetyBufferAtEntry": { "type": "number", "description": "Safety buffer at entry." },
-        "liqDistAtEntry": { "type": "number", "description": "Liquidation distance at entry." },
-        "durationMinutes": { "type": "number", "description": "Duration of the trade in minutes." },
-        "screenshot": { "type": "string", "description": "URL to a screenshot of the trade." }
+        "id": { "type": "string", "description": "Trade unique ID" },
+        "symbol": { "type": "string", "description": "Trading symbol" },
+        "entryPrice": { "type": "number", "description": "Entry price" },
+        "stopLoss": { "type": "number", "description": "Stop loss price" },
+        "quantity": { "type": "number", "description": "Trade quantity" },
+        "direction": { "type": "string", "enum": ["LONG", "SHORT"], "description": "Trade direction" },
+        "status": { "type": "string", "enum": ["OPEN", "CLOSED"], "description": "Trade status" },
+        "date": { "type": "string", "format": "date-time", "description": "Trade date" },
+        "exitPrice": { "type": "number", "description": "Exit price" },
+        "fees": { "type": "number", "description": "Trading fees" },
+        "pnl": { "type": "number", "description": "Profit and loss" },
+        "netPnl": { "type": "number", "description": "Net profit and loss" },
+        "notes": { "type": "string", "description": "Trade notes" },
+        "strategy": { "type": "string", "description": "Trading strategy used" },
+        "timeframe": { "type": "string", "description": "Trading timeframe" },
+        "emotion": { "type": "string", "description": "User emotion during trade" },
+        "marketCondition": { "type": "string", "description": "Market condition during trade" },
+        "tags": { "type": "array", "items": { "type": "string" }, "description": "Trade tags" }
       },
-      "required": ["id", "symbol", "direction", "entryPrice", "stopLoss", "date", "status"]
+      "required": ["id", "symbol", "entryPrice", "stopLoss", "quantity", "direction", "status", "date"]
     },
     "BalanceHistory": {
       "title": "Balance History Entry",
-      "description": "Tracks changes to the user's balance over time.",
+      "description": "An entry in the user's balance history",
       "type": "object",
       "properties": {
-        "id": { "type": "string", "description": "Unique ID." },
-        "date": { "type": "string", "format": "date-time", "description": "When the change occurred." },
-        "amount": { "type": "number", "description": "The balance amount after this change." },
-        "type": { "type": "string", "enum": ["DEPOSIT", "WITHDRAWAL", "TRADE"], "description": "Type of balance change." },
-        "note": { "type": "string", "description": "Optional note for the change." }
+        "id": { "type": "string", "description": "History entry unique ID" },
+        "date": { "type": "string", "format": "date-time", "description": "Entry date" },
+        "amount": { "type": "number", "description": "Amount changed" },
+        "type": { "type": "string", "enum": ["DEPOSIT", "WITHDRAWAL", "TRADE", "RESET"], "description": "Type of balance change" },
+        "note": { "type": "string", "description": "Optional note" },
+        "balanceAfter": { "type": "number", "description": "Balance after the change" }
       },
-      "required": ["id", "date", "amount", "type"]
+      "required": ["id", "date", "amount", "type", "balanceAfter"]
     }
   },
   "firestore": {
     "/users/{userId}": {
       "schema": "User",
-      "description": "User profile document."
+      "description": "User profile documents"
     },
-    "/users/{userId}/trades/{tradeId}": {
+    "/users/{userId}/trades": {
       "schema": "Trade",
-      "description": "Collection of trades for a specific user."
+      "description": "User's trade entries"
     },
-    "/users/{userId}/balanceHistory/{historyId}": {
+    "/users/{userId}/balanceHistory": {
       "schema": "BalanceHistory",
-      "description": "Collection of balance history entries for a specific user."
+      "description": "User's balance history entries"
     }
   }
 }
