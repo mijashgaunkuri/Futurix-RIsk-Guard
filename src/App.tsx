@@ -423,9 +423,9 @@ export default function App() {
               <TrendingUp className="w-10 h-10 text-zinc-950" />
             </div>
             <h1 className="text-3xl font-bold tracking-tight">
-              Futurix <span className="text-emerald-500">Risk Guard</span>
+              Barsha <span className="text-emerald-500">Journal</span>
             </h1>
-            <p className="text-zinc-400">Professional Trade Journaling & Risk Management</p>
+            <p className="text-zinc-400">Trade Journaling & Calculation</p>
           </div>
           
           <div className="space-y-4 pt-4">
@@ -456,7 +456,7 @@ export default function App() {
               <TrendingUp className="w-5 h-5 text-zinc-950" />
             </div>
             <h1 className="text-xl font-bold tracking-tight">
-              Futurix <span className="text-emerald-500">Risk Guard</span>
+              Barsha <span className="text-emerald-500">Journal</span>
             </h1>
           </div>
           
