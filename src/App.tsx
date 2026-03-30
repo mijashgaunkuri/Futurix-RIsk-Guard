@@ -406,6 +406,18 @@ export default function App() {
     }
   };
 
+  const handleSignIn = async () => {
+    try {
+      await signInWithGoogle();
+    } catch (error: any) {
+      if (error.code === 'auth/popup-closed-by-user') {
+        console.warn("Sign-in popup was closed by the user.");
+      } else {
+        console.error("Error signing in with Google", error);
+      }
+    }
+  };
+
   if (!isAuthReady) {
     return (
       <div className="min-h-screen bg-zinc-950 flex items-center justify-center">
@@ -430,7 +442,7 @@ export default function App() {
           
           <div className="space-y-4 pt-4">
             <button 
-              onClick={signInWithGoogle}
+              onClick={handleSignIn}
               className="w-full flex items-center justify-center gap-3 bg-white text-zinc-900 py-3 px-4 rounded-xl font-bold hover:bg-zinc-100 transition-all active:scale-[0.98]"
             >
               <img src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/auth/google.svg" className="w-5 h-5" alt="Google" />
@@ -451,7 +463,10 @@ export default function App() {
       {/* Header */}
       <header className="sticky top-0 z-40 bg-zinc-950/80 backdrop-blur-md border-b border-zinc-800">
         <div className="max-w-7xl mx-auto px-4 h-16 flex items-center justify-between">
-          <div className="flex items-center gap-2">
+          <div 
+            className="flex items-center gap-2 cursor-pointer hover:opacity-80 transition-opacity"
+            onClick={() => setActiveTab('calculator')}
+          >
             <div className="w-8 h-8 bg-emerald-500 rounded-lg flex items-center justify-center shadow-lg shadow-emerald-500/20">
               <TrendingUp className="w-5 h-5 text-zinc-950" />
             </div>
