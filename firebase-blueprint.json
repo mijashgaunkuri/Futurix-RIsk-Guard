@@ -39,7 +39,9 @@
         "timeframe": { "type": "string", "description": "Trading timeframe" },
         "emotion": { "type": "string", "description": "User emotion during trade" },
         "marketCondition": { "type": "string", "description": "Market condition during trade" },
-        "tags": { "type": "array", "items": { "type": "string" }, "description": "Trade tags" }
+        "tags": { "type": "array", "items": { "type": "string" }, "description": "Trade tags" },
+        "entryImage1h": { "type": "string", "format": "uri", "description": "Entry screenshot (1h)" },
+        "exitImage5min": { "type": "string", "format": "uri", "description": "Exit screenshot (5min)" }
       },
       "required": ["id", "symbol", "entryPrice", "stopLoss", "quantity", "direction", "status", "date"]
     },

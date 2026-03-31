@@ -49,7 +49,8 @@ export interface Trade {
   safetyBufferAtEntry?: number;
   liqDistAtEntry?: number;
   durationMinutes?: number;
-  screenshot?: string;
+  entryImage1h?: string;
+  exitImage5min?: string;
 }
 
 export interface BalanceHistory {

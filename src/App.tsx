@@ -559,7 +559,7 @@ export default function App() {
                 onClick={() => handleDeleteTrade(deletingTradeId)}
                 className="bg-rose-600 hover:bg-rose-500 text-white px-4 py-2 rounded-xl font-bold transition-all flex-1"
               >
-                Delete
+                Delete Trade
               </button>
             </div>
           </motion.div>
@@ -1385,7 +1385,7 @@ const LogTradeModal = ({ results, symbol, direction, leverage, entryPrice, stopL
   const [tagInput, setTagInput] = useState('');
   const [updateGlobalBalance, setUpdateGlobalBalance] = useState(true);
   const [isConfirmed, setIsConfirmed] = useState(false);
-  const [screenshot, setScreenshot] = useState<string | null>(null);
+  const [entryImage1h, setEntryImage1h] = useState<string | null>(null);
 
   useEffect(() => {
     if (strategy === 'CRT+TBS' && !['1h', '5m'].includes(timeframe)) {
@@ -1393,7 +1393,7 @@ const LogTradeModal = ({ results, symbol, direction, leverage, entryPrice, stopL
     }
   }, [strategy, timeframe]);
 
-  const handleScreenshotChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>, setter: (val: string | null) => void) => {
     const file = e.target.files?.[0];
     if (file) {
       if (file.size > 2 * 1024 * 1024) {
@@ -1402,7 +1402,7 @@ const LogTradeModal = ({ results, symbol, direction, leverage, entryPrice, stopL
       }
       const reader = new FileReader();
       reader.onloadend = () => {
-        setScreenshot(reader.result as string);
+        setter(reader.result as string);
       };
       reader.readAsDataURL(file);
     }
@@ -1447,7 +1447,7 @@ const LogTradeModal = ({ results, symbol, direction, leverage, entryPrice, stopL
       balanceBefore: currentBalance,
       safetyBufferAtEntry: results.safetyBuffer,
       liqDistAtEntry: results.distToLiq,
-      screenshot,
+      entryImage1h: entryImage1h || undefined,
     };
     onSave(trade);
   };
@@ -1597,28 +1597,36 @@ const LogTradeModal = ({ results, symbol, direction, leverage, entryPrice, stopL
             />
           </div>
 
-          <div className="space-y-2">
-            <label className="text-xs font-semibold text-zinc-500 uppercase">Trade Screenshot (Optional)</label>
-            <div className="flex items-center gap-4">
-              <label className="flex-1 cursor-pointer">
-                <div className="border-2 border-dashed border-zinc-800 rounded-xl p-4 hover:border-emerald-500/50 transition-all flex flex-col items-center gap-2 bg-zinc-950/50">
-                  <Upload className="w-6 h-6 text-zinc-500" />
-                  <span className="text-xs text-zinc-400">Click to upload or drag and drop</span>
-                  <span className="text-[10px] text-zinc-600">PNG, JPG up to 2MB</span>
+          <div className="space-y-4">
+            <label className="text-xs font-semibold text-zinc-500 uppercase">Trade Media (Optional)</label>
+            <div className="grid grid-cols-1 gap-4">
+              <div className="space-y-2">
+                <label className="text-[10px] text-zinc-500 uppercase font-bold">Entry Screenshot (1h)</label>
+                <div className="flex flex-col gap-2">
+                  <div className="flex items-center gap-4">
+                    <label className="flex-1 cursor-pointer">
+                      <div className="border-2 border-dashed border-zinc-800 rounded-xl p-4 hover:border-emerald-500/50 transition-all flex flex-col items-center gap-2 bg-zinc-950/50">
+                        <Upload className="w-5 h-5 text-zinc-500" />
+                        <span className="text-[10px] text-zinc-400">Upload 1h Entry</span>
+                      </div>
+                      <input type="file" className="hidden" accept="image/*" onChange={(e) => handleImageUpload(e, setEntryImage1h)} />
+                    </label>
+                    {entryImage1h && (
+                      <div className="relative w-16 h-16 rounded-lg overflow-hidden border border-zinc-800 shrink-0">
+                        <img src={entryImage1h} alt="Entry 1h" className="w-full h-full object-cover" />
+                        <button onClick={() => setEntryImage1h(null)} className="absolute top-0.5 right-0.5 p-0.5 bg-rose-500 rounded-full text-white"><Trash2 className="w-2.5 h-2.5" /></button>
+                      </div>
+                    )}
+                  </div>
+                  <input 
+                    type="text"
+                    value={entryImage1h && !entryImage1h.startsWith('data:') ? entryImage1h : ''}
+                    onChange={(e) => setEntryImage1h(e.target.value)}
+                    className="input-field w-full text-[10px]"
+                    placeholder="Or paste 1h image URL..."
+                  />
                 </div>
-                <input type="file" className="hidden" accept="image/*" onChange={handleScreenshotChange} />
-              </label>
-              {screenshot && (
-                <div className="relative w-24 h-24 rounded-xl overflow-hidden border border-zinc-800 shrink-0">
-                  <img src={screenshot} alt="Preview" className="w-full h-full object-cover" />
-                  <button 
-                    onClick={() => setScreenshot(undefined)}
-                    className="absolute top-1 right-1 p-1 bg-rose-500 rounded-full text-white hover:bg-rose-600 transition-colors"
-                  >
-                    <Trash2 className="w-3 h-3" />
-                  </button>
-                </div>
-              )}
+              </div>
             </div>
           </div>
 
@@ -1689,6 +1697,7 @@ const CloseTradeModal = ({ trade, onClose, onSave }: { trade: Trade, onClose: ()
   const [lowestPrice, setLowestPrice] = useState('');
   const [postReflection, setPostReflection] = useState('');
   const [exitRationale, setExitRationale] = useState('');
+  const [exitImage5min, setExitImage5min] = useState<string | undefined>(undefined);
   const [isRevenge, setIsRevenge] = useState(false);
   const [followedPlan, setFollowedPlan] = useState<'YES' | 'PARTIAL' | 'NO'>('YES');
   const [isBreakevenMoved, setIsBreakevenMoved] = useState(false);
@@ -1754,12 +1763,28 @@ const CloseTradeModal = ({ trade, onClose, onSave }: { trade: Trade, onClose: ()
       actualRR: metrics.actualRR,
       postTradeReflection: postReflection,
       exitRationale,
+      exitImage5min,
       isRevengeTrade: isRevenge,
       followedPlan,
       isBreakevenMoved,
       partialExitsCount: parseInt(partialExits) || 0,
       durationMinutes: Math.floor((new Date().getTime() - new Date(trade.date).getTime()) / 60000),
     });
+  };
+
+  const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>, setter: (val: string) => void) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      if (file.size > 2 * 1024 * 1024) {
+        alert("File size too large. Please upload an image smaller than 2MB.");
+        return;
+      }
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        setter(reader.result as string);
+      };
+      reader.readAsDataURL(file);
+    }
   };
 
   return (
@@ -1904,6 +1929,39 @@ const CloseTradeModal = ({ trade, onClose, onSave }: { trade: Trade, onClose: ()
           </div>
 
           <div className="space-y-2">
+            <label className="text-xs font-semibold text-zinc-500 uppercase">Exit Screenshot (5min)</label>
+            <div className="flex flex-col gap-2">
+              <div className="flex items-center gap-4">
+                <label className="flex-1 cursor-pointer">
+                  <div className="border-2 border-dashed border-zinc-800 rounded-xl p-4 hover:border-emerald-500/50 transition-all flex flex-col items-center gap-2 bg-zinc-950/50">
+                    <Upload className="w-6 h-6 text-zinc-500" />
+                    <span className="text-xs text-zinc-400">Upload 5min Exit Screenshot</span>
+                  </div>
+                  <input type="file" className="hidden" accept="image/*" onChange={(e) => handleImageUpload(e, setExitImage5min)} />
+                </label>
+                {exitImage5min && (
+                  <div className="relative w-24 h-24 rounded-xl overflow-hidden border border-zinc-800 shrink-0">
+                    <img src={exitImage5min} alt="Exit 5min" className="w-full h-full object-cover" />
+                    <button 
+                      onClick={() => setExitImage5min(undefined)}
+                      className="absolute top-1 right-1 p-1 bg-rose-500 rounded-full text-white hover:bg-rose-600 transition-colors"
+                    >
+                      <Trash2 className="w-3 h-3" />
+                    </button>
+                  </div>
+                )}
+              </div>
+              <input 
+                type="text"
+                value={exitImage5min && !exitImage5min.startsWith('data:') ? exitImage5min : ''}
+                onChange={(e) => setExitImage5min(e.target.value)}
+                className="input-field w-full text-xs"
+                placeholder="Or paste 5min exit image URL..."
+              />
+            </div>
+          </div>
+
+          <div className="space-y-2">
             <label className="text-xs font-semibold text-zinc-500 uppercase">Post-Trade Reflection</label>
             <textarea 
               value={postReflection}
@@ -1937,7 +1995,8 @@ const EditTradeModal = ({ trade, onClose, onSave }: { trade: Trade, onClose: () 
   const [marketCondition, setMarketCondition] = useState(trade.marketCondition);
   const [tags, setTags] = useState<string[]>(trade.tags || []);
   const [tagInput, setTagInput] = useState('');
-  const [screenshot, setScreenshot] = useState<string | null>(trade.screenshot || null);
+  const [entryImage1h, setEntryImage1h] = useState<string | null>(trade.entryImage1h || null);
+  const [exitImage5min, setExitImage5min] = useState<string | null>(trade.exitImage5min || null);
   
   // For CLOSED trades
   const [exitPrice, setExitPrice] = useState(trade.exitPrice?.toString() || '');
@@ -1965,7 +2024,7 @@ const EditTradeModal = ({ trade, onClose, onSave }: { trade: Trade, onClose: () 
     });
   }, [exitPrice, fees, highestPrice, lowestPrice, trade]);
 
-  const handleScreenshotChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>, setter: (val: string | null) => void) => {
     const file = e.target.files?.[0];
     if (file) {
       if (file.size > 2 * 1024 * 1024) {
@@ -1974,7 +2033,7 @@ const EditTradeModal = ({ trade, onClose, onSave }: { trade: Trade, onClose: () 
       }
       const reader = new FileReader();
       reader.onloadend = () => {
-        setScreenshot(reader.result as string);
+        setter(reader.result as string);
       };
       reader.readAsDataURL(file);
     }
@@ -1997,7 +2056,8 @@ const EditTradeModal = ({ trade, onClose, onSave }: { trade: Trade, onClose: () 
       emotion,
       marketCondition,
       tags,
-      screenshot,
+      entryImage1h: entryImage1h || undefined,
+      exitImage5min: exitImage5min || undefined,
     };
 
     if (trade.status === 'CLOSED') {
@@ -2232,27 +2292,59 @@ const EditTradeModal = ({ trade, onClose, onSave }: { trade: Trade, onClose: () 
             />
           </div>
 
-          <div className="space-y-2">
-            <label className="text-xs font-semibold text-zinc-500 uppercase">Screenshot</label>
-            <div className="flex items-center gap-4">
-              <label className="flex-1 cursor-pointer">
-                <div className="border-2 border-dashed border-zinc-800 rounded-xl p-4 hover:border-blue-500/50 transition-all flex flex-col items-center gap-2 bg-zinc-950/50">
-                  <Upload className="w-6 h-6 text-zinc-500" />
-                  <span className="text-xs text-zinc-400">Update screenshot</span>
+          <div className="space-y-4 pt-6 border-t border-zinc-800">
+            <label className="text-xs font-semibold text-zinc-500 uppercase">Trade Media</label>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div className="space-y-2">
+                <label className="text-[10px] text-zinc-500 uppercase font-bold">Entry (1h)</label>
+                <div className="flex flex-col gap-2">
+                  <label className="cursor-pointer">
+                    <div className="border-2 border-dashed border-zinc-800 rounded-xl p-3 hover:border-blue-500/50 transition-all flex flex-col items-center gap-1 bg-zinc-950/50">
+                      <Upload className="w-4 h-4 text-zinc-500" />
+                      <span className="text-[10px] text-zinc-400">Update 1h</span>
+                    </div>
+                    <input type="file" className="hidden" accept="image/*" onChange={(e) => handleImageUpload(e, setEntryImage1h)} />
+                  </label>
+                  <input 
+                    type="text"
+                    value={entryImage1h && !entryImage1h.startsWith('data:') ? entryImage1h : ''}
+                    onChange={(e) => setEntryImage1h(e.target.value)}
+                    className="input-field w-full text-[10px]"
+                    placeholder="Or paste 1h URL..."
+                  />
+                  {entryImage1h && (
+                    <div className="relative aspect-video rounded-lg overflow-hidden border border-zinc-800">
+                      <img src={entryImage1h} alt="Entry 1h" className="w-full h-full object-cover" />
+                      <button onClick={() => setEntryImage1h(null)} className="absolute top-1 right-1 p-1 bg-rose-500 rounded-full text-white"><Trash2 className="w-2.5 h-2.5" /></button>
+                    </div>
+                  )}
                 </div>
-                <input type="file" className="hidden" accept="image/*" onChange={handleScreenshotChange} />
-              </label>
-              {screenshot && (
-                <div className="relative w-24 h-24 rounded-xl overflow-hidden border border-zinc-800 shrink-0">
-                  <img src={screenshot} alt="Preview" className="w-full h-full object-cover" />
-                  <button 
-                    onClick={() => setScreenshot(null)}
-                    className="absolute top-1 right-1 p-1 bg-rose-500 rounded-full text-white hover:bg-rose-600 transition-colors"
-                  >
-                    <Trash2 className="w-3 h-3" />
-                  </button>
+              </div>
+              <div className="space-y-2">
+                <label className="text-[10px] text-zinc-500 uppercase font-bold">Exit (5min)</label>
+                <div className="flex flex-col gap-2">
+                  <label className="cursor-pointer">
+                    <div className="border-2 border-dashed border-zinc-800 rounded-xl p-3 hover:border-blue-500/50 transition-all flex flex-col items-center gap-1 bg-zinc-950/50">
+                      <Upload className="w-4 h-4 text-zinc-500" />
+                      <span className="text-[10px] text-zinc-400">Update 5min</span>
+                    </div>
+                    <input type="file" className="hidden" accept="image/*" onChange={(e) => handleImageUpload(e, setExitImage5min)} />
+                  </label>
+                  <input 
+                    type="text"
+                    value={exitImage5min && !exitImage5min.startsWith('data:') ? exitImage5min : ''}
+                    onChange={(e) => setExitImage5min(e.target.value)}
+                    className="input-field w-full text-[10px]"
+                    placeholder="Or paste 5min URL..."
+                  />
+                  {exitImage5min && (
+                    <div className="relative aspect-video rounded-lg overflow-hidden border border-zinc-800">
+                      <img src={exitImage5min} alt="Exit 5min" className="w-full h-full object-cover" />
+                      <button onClick={() => setExitImage5min(null)} className="absolute top-1 right-1 p-1 bg-rose-500 rounded-full text-white"><Trash2 className="w-2.5 h-2.5" /></button>
+                    </div>
+                  )}
                 </div>
-              )}
+              </div>
             </div>
           </div>
         </div>
@@ -2830,14 +2922,27 @@ const JournalTab = ({
                 </div>
               </div>
 
-              {reviewTrade.screenshot && (
-                <div className="space-y-4">
-                  <h3 className="text-xs font-bold uppercase text-zinc-500">Screenshot</h3>
-                  <div className="rounded-xl overflow-hidden border border-zinc-800 bg-zinc-950">
-                    <img src={reviewTrade.screenshot} alt="Trade Screenshot" className="w-full h-auto" />
-                  </div>
+              <div className="space-y-4">
+                <h3 className="text-xs font-bold uppercase text-zinc-500">Trade Media</h3>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  {reviewTrade.entryImage1h && (
+                    <div className="space-y-2">
+                      <span className="text-[10px] text-zinc-500 uppercase font-bold">Entry (1h)</span>
+                      <div className="rounded-xl overflow-hidden border border-zinc-800 bg-zinc-950">
+                        <img src={reviewTrade.entryImage1h} alt="Entry 1h" className="w-full h-auto" />
+                      </div>
+                    </div>
+                  )}
+                  {reviewTrade.exitImage5min && (
+                    <div className="space-y-2">
+                      <span className="text-[10px] text-zinc-500 uppercase font-bold">Exit (5min)</span>
+                      <div className="rounded-xl overflow-hidden border border-zinc-800 bg-zinc-950">
+                        <img src={reviewTrade.exitImage5min} alt="Exit 5min" className="w-full h-auto" />
+                      </div>
+                    </div>
+                  )}
                 </div>
-              )}
+              </div>
             </div>
             <div className="p-6 border-t border-zinc-800">
               <button onClick={() => setReviewTrade(null)} className="btn-secondary w-full">Close Review</button>
@@ -2907,8 +3012,8 @@ const JournalTab = ({
                 <Upload className="w-4 h-4" />
                 <input type="file" className="hidden" onChange={importData} accept=".json" />
               </label>
-              <button onClick={clearData} className="btn-secondary p-2 text-rose-500 hover:bg-rose-500/10" title="Clear All Data">
-                <Trash2 className="w-4 h-4" />
+              <button onClick={clearData} className="btn-secondary p-2 text-rose-500 hover:bg-rose-500/10" title="DANGER: Clear All Data">
+                <AlertTriangle className="w-4 h-4" />
               </button>
             </div>
           </div>
@@ -3101,8 +3206,30 @@ const JournalTab = ({
                     )}
                   </td>
                   <td className="px-4 py-4">
-                    <div className="w-10 h-8 rounded border border-dashed border-zinc-800 flex items-center justify-center bg-zinc-950/50">
-                      <ImageIcon className="w-4 h-4 text-zinc-700" />
+                    <div className="flex items-center gap-1.5">
+                      {t.entryImage1h && (
+                        <div 
+                          onClick={() => setReviewTrade(t)}
+                          className="w-10 h-7 rounded border border-emerald-500/30 overflow-hidden cursor-pointer hover:border-emerald-500 transition-colors bg-zinc-950"
+                          title="View Entry Screenshot"
+                        >
+                          <img src={t.entryImage1h} className="w-full h-full object-cover" referrerPolicy="no-referrer" />
+                        </div>
+                      )}
+                      {t.exitImage5min && (
+                        <div 
+                          onClick={() => setReviewTrade(t)}
+                          className="w-10 h-7 rounded border border-rose-500/30 overflow-hidden cursor-pointer hover:border-rose-500 transition-colors bg-zinc-950"
+                          title="View Exit Screenshot"
+                        >
+                          <img src={t.exitImage5min} className="w-full h-full object-cover" referrerPolicy="no-referrer" />
+                        </div>
+                      )}
+                      {!t.entryImage1h && !t.exitImage5min && (
+                        <div className="w-10 h-7 rounded border border-zinc-800 flex items-center justify-center bg-zinc-950/50 opacity-20">
+                          <ImageIcon className="w-3 h-3 text-zinc-500" />
+                        </div>
+                      )}
                     </div>
                   </td>
                   <td className="px-4 py-4 text-right">
