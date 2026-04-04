@@ -1,20 +1,23 @@
-<div align="center">
-<img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
-</div>
+# Barsha Journal & Calculator
 
-# Run and deploy your AI Studio app
+A professional-grade trading journal and risk management calculator for perpetual futures traders.
 
-This contains everything you need to run your app locally.
+## Features
+- **Advanced Risk Calculator**: Tiered MMR, Liquidation Price (Isolated/Cross), Net PNL (Fees/Funding).
+- **Execution Journal**: Log, Close, and Review trades with MFE/MAE and Slippage tracking.
+- **OCR Screenshot**: Automatically extract trade details (Symbol, Entry, SL, TP, Direction) from exchange screenshots using Gemini AI.
+- **Mobile Optimized**: Fully responsive UI with a dedicated mobile card view for the trading journal.
+- **Import/Export**: Full JSON backup/restore, CSV export, and **Binance CSV Trade History import**.
+- **Advanced Analytics**: Monte Carlo Simulation, Market Regime Analysis, and Psychological Metrics.
+- **Real-time Sync**: Firebase Auth and Firestore integration.
 
-View your app in AI Studio: https://ai.studio/apps/7e4e20f5-81f3-4aa8-b848-a580bcb5d8a9
+## Documentation
+For detailed technical documentation on the logic, functions, and features, please refer to:
+[**DOCUMENTATION.md**](./DOCUMENTATION.md)
 
-## Run Locally
-
-**Prerequisites:**  Node.js
-
-
-1. Install dependencies:
-   `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
-3. Run the app:
-   `npm run dev`
+## Tech Stack
+- React 18 + Vite
+- Tailwind CSS
+- Framer Motion
+- Recharts
+- Firebase (Auth/Firestore)

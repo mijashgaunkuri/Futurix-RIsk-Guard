@@ -13,6 +13,7 @@ export interface Trade {
   stopLoss: number;
   takeProfit?: number;
   exitPrice?: number;
+  expectedExitPrice?: number;
   quantity: number;
   notionalValue: number;
   initialMargin: number;
@@ -22,6 +23,8 @@ export interface Trade {
   pnl: number;
   fees: number;
   netPnl: number;
+  slippagePercent?: number;
+  slippageUsdt?: number;
   strategy: string;
   timeframe: string;
   notes: string;
@@ -31,6 +34,8 @@ export interface Trade {
   marketCondition: string;
   tags: string[];
   status: 'OPEN' | 'CLOSED';
+  marginMode: 'ISOLATED' | 'CROSS';
+  addedMargin: number;
   plannedRR: number;
   actualRR?: number;
   balanceBefore: number;

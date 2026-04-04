@@ -4,6 +4,7 @@
  */
 
 import React, { useState, useEffect, useMemo, useRef } from 'react';
+import { GoogleGenAI, Type } from "@google/genai";
 import { 
   Calculator, 
   BookOpen, 
@@ -13,6 +14,7 @@ import {
   TrendingDown, 
   Plus, 
   Trash2, 
+  Camera,
   Download, 
   Upload, 
   RefreshCw, 
@@ -43,7 +45,8 @@ import {
   Shield,
   ShieldCheck,
   Brain,
-  FileText
+  FileText,
+  PlusCircle
 } from 'lucide-react';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
@@ -257,6 +260,12 @@ export default function App() {
   const [deletingTradeId, setDeletingTradeId] = useState<string | null>(null);
   const [editingTrade, setEditingTrade] = useState<Trade | null>(null);
 
+  const totalUsedMargin = useMemo(() => {
+    return trades
+      .filter(t => t.status === 'OPEN')
+      .reduce((sum, t) => sum + t.initialMargin + (t.addedMargin || 0), 0);
+  }, [trades]);
+
   const updateBalance = async (amount: number, type: 'DEPOSIT' | 'WITHDRAWAL' | 'TRADE' | 'RESET', note: string = '') => {
     if (!user) return;
     try {
@@ -288,6 +297,8 @@ export default function App() {
   const handleLogTrade = async (trade: Trade) => {
     if (!user) return;
     try {
+      // Deduct initial margin on open (Binance style)
+      await updateBalance(-trade.initialMargin, 'TRADE', `Margin for ${trade.symbol}`);
       await setDoc(doc(db, 'users', user.uid, 'trades', trade.id), cleanObject(trade));
     } catch (error) {
       handleFirestoreError(error, OperationType.CREATE, `users/${user.uid}/trades/${trade.id}`);
@@ -297,6 +308,16 @@ export default function App() {
   const handleDeleteTrade = async (tradeId: string) => {
     if (!user) return;
     try {
+      const tradeToDelete = trades.find(t => t.id === tradeId);
+      if (tradeToDelete) {
+        if (tradeToDelete.status === 'OPEN') {
+          // Refund margin if an open trade is deleted
+          await updateBalance(tradeToDelete.initialMargin, 'TRADE', `Refund margin for deleted trade ${tradeToDelete.symbol}`);
+        } else {
+          // Revert PNL if a closed trade is deleted
+          await updateBalance(-tradeToDelete.netPnl, 'TRADE', `Revert PNL for deleted trade ${tradeToDelete.symbol}`);
+        }
+      }
       await deleteDoc(doc(db, 'users', user.uid, 'trades', tradeId));
       setDeletingTradeId(null);
     } catch (error) {
@@ -309,11 +330,35 @@ export default function App() {
     try {
       const oldTrade = trades.find(t => t.id === updatedTrade.id);
       
-      // If it's a CLOSED trade and Net PNL changed, update balance
-      if (oldTrade && oldTrade.status === 'CLOSED' && updatedTrade.status === 'CLOSED') {
-        const pnlDiff = updatedTrade.netPnl - oldTrade.netPnl;
-        if (Math.abs(pnlDiff) > 0.001) {
-          await updateBalance(pnlDiff, 'TRADE', `Adjustment for trade ${updatedTrade.symbol}`);
+      if (oldTrade) {
+        // 1. Handle trade closing (OPEN -> CLOSED)
+        if (oldTrade.status === 'OPEN' && updatedTrade.status === 'CLOSED') {
+          const releaseAmount = oldTrade.initialMargin + updatedTrade.netPnl;
+          await updateBalance(releaseAmount, 'TRADE', `Close trade ${updatedTrade.symbol}`);
+        }
+        
+        // 2. Handle trade reopening (CLOSED -> OPEN)
+        else if (oldTrade.status === 'CLOSED' && updatedTrade.status === 'OPEN') {
+          const revertAmount = -(oldTrade.initialMargin + oldTrade.netPnl);
+          await updateBalance(revertAmount, 'TRADE', `Reopen trade ${updatedTrade.symbol}`);
+        }
+        
+        // 3. Handle margin adjustments for OPEN trades (e.g. quantity/leverage change or added margin)
+        else if (oldTrade.status === 'OPEN' && updatedTrade.status === 'OPEN') {
+          const oldTotalMargin = oldTrade.initialMargin + (oldTrade.addedMargin || 0);
+          const newTotalMargin = updatedTrade.initialMargin + (updatedTrade.addedMargin || 0);
+          const marginDiff = oldTotalMargin - newTotalMargin;
+          if (Math.abs(marginDiff) > 0.001) {
+            await updateBalance(marginDiff, 'TRADE', `Margin adjustment for ${updatedTrade.symbol}`);
+          }
+        }
+        
+        // 4. Handle PNL adjustments for CLOSED trades
+        else if (oldTrade.status === 'CLOSED' && updatedTrade.status === 'CLOSED') {
+          const pnlDiff = updatedTrade.netPnl - oldTrade.netPnl;
+          if (Math.abs(pnlDiff) > 0.001) {
+            await updateBalance(pnlDiff, 'TRADE', `Adjustment for trade ${updatedTrade.symbol}`);
+          }
         }
       }
 
@@ -371,6 +416,105 @@ export default function App() {
       } catch (err) {
         console.error("Import error", err);
         alert('Invalid backup file or sync failed.');
+      }
+    };
+    reader.readAsText(file);
+  };
+
+  const importBinanceCSV = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (!user) return;
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = async (event) => {
+      const text = event.target?.result as string;
+      const lines = text.split('\n').filter(line => line.trim() !== '');
+      if (lines.length < 2) return;
+
+      const headers = lines[0].split(',').map(h => h.trim().replace(/"/g, ''));
+      const trades_to_import: Trade[] = [];
+
+      // Simple heuristic to find columns
+      const dateIdx = headers.findIndex(h => h.toLowerCase().includes('date') || h.toLowerCase().includes('time'));
+      const symbolIdx = headers.findIndex(h => h.toLowerCase().includes('symbol') || h.toLowerCase().includes('market'));
+      const sideIdx = headers.findIndex(h => h.toLowerCase().includes('side') || h.toLowerCase().includes('direction'));
+      const priceIdx = headers.findIndex(h => h.toLowerCase().includes('price'));
+      const qtyIdx = headers.findIndex(h => h.toLowerCase().includes('qty') || h.toLowerCase().includes('amount') || h.toLowerCase().includes('quantity'));
+      const pnlIdx = headers.findIndex(h => h.toLowerCase().includes('realized profit') || h.toLowerCase().includes('pnl'));
+      const feeIdx = headers.findIndex(h => h.toLowerCase().includes('fee'));
+
+      if (dateIdx === -1 || symbolIdx === -1 || priceIdx === -1) {
+        alert("Could not detect required columns (Date, Symbol, Price) in CSV.");
+        return;
+      }
+
+      for (let i = 1; i < lines.length; i++) {
+        const cols = lines[i].split(',').map(c => c.trim().replace(/"/g, ''));
+        if (cols.length < headers.length) continue;
+
+        const d = new Date(cols[dateIdx]);
+        if (isNaN(d.getTime())) continue;
+        const date = d.toISOString();
+
+        const symbol = cols[symbolIdx].toUpperCase();
+        const direction = cols[sideIdx]?.toUpperCase().includes('BUY') || cols[sideIdx]?.toUpperCase().includes('LONG') ? 'LONG' : 'SHORT';
+        const entryPrice = parseFloat(cols[priceIdx]);
+        const quantity = parseFloat(cols[qtyIdx]) || 0;
+        const pnl = parseFloat(cols[pnlIdx]) || 0;
+        const fees = Math.abs(parseFloat(cols[feeIdx])) || 0;
+
+        // Create a basic trade object
+        const newTrade: Trade = {
+          id: `binance_${Date.now()}_${i}`,
+          date,
+          symbol,
+          direction,
+          entryPrice,
+          quantity,
+          leverage: 1,
+          notionalValue: entryPrice * quantity,
+          initialMargin: entryPrice * quantity, // Assuming 1x leverage
+          maintenanceMargin: 0,
+          liquidationPrice: 0,
+          riskAmount: 0,
+          stopLoss: 0,
+          takeProfit: 0,
+          plannedRR: 0,
+          strategy: 'Imported (Binance)',
+          timeframe: 'Unknown',
+          status: pnl !== 0 ? 'CLOSED' : 'OPEN',
+          notes: 'Imported from Binance CSV Trade History',
+          tags: ['#imported', '#binance'],
+          marginMode: 'CROSS',
+          addedMargin: 0,
+          pnl: pnl + fees,
+          fees,
+          netPnl: pnl,
+          actualRR: 0,
+          exitEfficiency: 0,
+          emotion: 'Neutral',
+          marketCondition: 'Ranging',
+          balanceBefore: currentBalance
+        };
+
+        trades_to_import.push(newTrade);
+      }
+
+      if (trades_to_import.length > 0) {
+        try {
+          const batch = writeBatch(db);
+          trades_to_import.forEach(t => {
+            batch.set(doc(db, 'users', user.uid, 'trades', t.id), t);
+          });
+          await batch.commit();
+          alert(`Successfully imported ${trades_to_import.length} trades from Binance CSV!`);
+        } catch (err) {
+          console.error("CSV Import error", err);
+          alert("Failed to sync imported trades to cloud.");
+        }
+      } else {
+        alert("No valid trades found in CSV.");
       }
     };
     reader.readAsText(file);
@@ -476,11 +620,21 @@ export default function App() {
           </div>
           
           <div className="flex items-center gap-4">
+            <div className="flex flex-col items-end md:hidden">
+              <span className="text-[8px] text-zinc-500 uppercase font-bold tracking-wider">Balance</span>
+              <span className="text-sm font-mono font-bold text-emerald-500">${currentBalance.toLocaleString(undefined, { maximumFractionDigits: 0 })}</span>
+            </div>
             <div className="hidden md:flex flex-col items-end">
-              <span className="text-xs text-zinc-500 uppercase font-semibold">Current Balance</span>
+              <span className="text-[10px] text-zinc-500 uppercase font-bold tracking-wider">Available Balance</span>
               <div className="flex flex-col items-end">
                 <span className="text-lg font-mono font-bold text-emerald-500">${currentBalance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
-                <span className="text-[10px] font-mono font-bold text-zinc-500">≈ Rs. {(currentBalance * nprRate).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+              </div>
+            </div>
+            <div className="w-px h-8 bg-zinc-800 hidden md:block" />
+            <div className="hidden md:flex flex-col items-end">
+              <span className="text-[10px] text-zinc-500 uppercase font-bold tracking-wider">Used Margin</span>
+              <div className="flex flex-col items-end">
+                <span className="text-lg font-mono font-bold text-amber-500">${totalUsedMargin.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
               </div>
             </div>
             <div className="w-px h-8 bg-zinc-800 hidden md:block" />
@@ -572,6 +726,7 @@ export default function App() {
             onLogTrade={handleLogTrade}
             onUpdateBalance={updateBalance}
             nprRate={nprRate}
+            trades={trades}
           />
         )}
         {activeTab === 'journal' && (
@@ -589,7 +744,9 @@ export default function App() {
             setEditingTrade={setEditingTrade}
             exportData={exportData}
             importData={importData}
+            importBinanceCSV={importBinanceCSV}
             clearData={clearData}
+            setActiveTab={setActiveTab}
           />
         )}
         {activeTab === 'stats' && (
@@ -637,7 +794,7 @@ export default function App() {
 }
 
 // Placeholder components to be implemented in next steps
-const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate }: { currentBalance: number, onLogTrade: (t: Trade) => void, onUpdateBalance: (a: number, t: 'DEPOSIT' | 'WITHDRAWAL' | 'TRADE', n: string) => void, nprRate: number }) => {
+const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, trades }: { currentBalance: number, onLogTrade: (t: Trade) => void, onUpdateBalance: (a: number, t: 'DEPOSIT' | 'WITHDRAWAL' | 'TRADE' | 'RESET', n: string) => void, nprRate: number, trades: Trade[] }) => {
   const [direction, setDirection] = useState<TradeDirection>(() => {
     try {
       const saved = localStorage.getItem('calculator_trade_params');
@@ -682,8 +839,86 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate }:
       return saved ? JSON.parse(saved).leverage ?? 10 : 10;
     } catch (e) { return 10; }
   });
+  const [expectedHoldHours, setExpectedHoldHours] = useState(8);
+  const [fundingRate, setFundingRate] = useState(0.01); // Default 0.01%
+  const [makerFee, setMakerFee] = useState(0.02); // 0.02%
+  const [takerFee, setTakerFee] = useState(0.05); // 0.05%
+  const [entryFeeType, setEntryFeeType] = useState<'MAKER' | 'TAKER'>('TAKER');
+  const [exitFeeType, setExitFeeType] = useState<'MAKER' | 'TAKER'>('TAKER');
+  const [marginMode, setMarginMode] = useState<'ISOLATED' | 'CROSS'>('ISOLATED');
   const [isFetching, setIsFetching] = useState(false);
   const [isModalOpen, setIsModalOpen] = useState(false);
+  const [isScanning, setIsScanning] = useState(false);
+  const [scanError, setScanError] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const handleScanScreenshot = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    setIsScanning(true);
+    setScanError(null);
+    try {
+      const reader = new FileReader();
+      reader.onload = async (event) => {
+        try {
+          const base64Data = event.target?.result?.toString().split(',')[1];
+          if (!base64Data) throw new Error("Failed to read file");
+
+          const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || '' });
+          const response = await ai.models.generateContent({
+            model: "gemini-3-flash-preview",
+            contents: [
+              {
+                inlineData: {
+                  data: base64Data,
+                  mimeType: file.type,
+                },
+              },
+              {
+                text: "Extract trade details from this exchange screenshot. Return a JSON object with: symbol (e.g. BTCUSDT), direction (LONG or SHORT), entryPrice (number), stopLoss (number), takeProfit (number). If any field is not found, return null for it.",
+              },
+            ],
+            config: {
+              responseMimeType: "application/json",
+              responseSchema: {
+                type: Type.OBJECT,
+                properties: {
+                  symbol: { type: Type.STRING },
+                  direction: { type: Type.STRING, enum: ["LONG", "SHORT"] },
+                  entryPrice: { type: Type.NUMBER },
+                  stopLoss: { type: Type.NUMBER },
+                  takeProfit: { type: Type.NUMBER },
+                },
+              },
+            },
+          });
+
+          const text = response.text;
+          if (!text) throw new Error("No response from AI");
+          
+          const result = JSON.parse(text);
+          if (result.symbol) setSymbol(result.symbol.toUpperCase());
+          if (result.direction) setDirection(result.direction);
+          if (result.entryPrice) setEntryPrice(result.entryPrice);
+          if (result.stopLoss) setStopLoss(result.stopLoss);
+          if (result.takeProfit) setTakeProfit(result.takeProfit);
+        } catch (innerError: any) {
+          console.error("AI Scanning failed", innerError);
+          setScanError("AI failed to parse screenshot. Try a clearer image.");
+        } finally {
+          setIsScanning(false);
+        }
+      };
+      reader.readAsDataURL(file);
+    } catch (error) {
+      console.error("File reading failed", error);
+      setScanError("Failed to read image file.");
+      setIsScanning(false);
+    } finally {
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    }
+  };
 
   // Auto-save persistence
   useEffect(() => {
@@ -705,7 +940,11 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate }:
     if (!entryPrice || !stopLoss || entryPrice === stopLoss) return null;
 
     const riskAmount = balance * (riskPercent / 100);
-    const priceDiff = Math.abs(entryPrice - stopLoss);
+    const priceDiff = direction === 'LONG' ? (entryPrice - stopLoss) : (stopLoss - entryPrice);
+    
+    // Ensure priceDiff is positive for valid trades (SL must be below entry for LONG, above for SHORT)
+    if (priceDiff <= 0) return null;
+
     const quantity = riskAmount / priceDiff;
     const notionalValue = quantity * entryPrice;
 
@@ -714,22 +953,50 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate }:
     const tier = tiers.find(t => notionalValue <= t.bracket) || tiers[tiers.length - 1];
     const mmr = tier.mmr;
     const maintenanceAmount = tier.maintenanceAmount;
-    const maintenanceMargin = (notionalValue * mmr) - maintenanceAmount;
 
     // Initial Margin
     const initialMargin = notionalValue / leverage;
+
+    // Fee Calculation
+    const entryFeeRate = (entryFeeType === 'MAKER' ? makerFee : takerFee) / 100;
+    const exitFeeRate = (exitFeeType === 'MAKER' ? makerFee : takerFee) / 100;
+    
+    const entryFee = notionalValue * entryFeeRate;
+    const exitFee = notionalValue * exitFeeRate; // Approximate exit fee based on entry notional
+    
+    // Taker fee for liquidation (exchanges often add this to MM requirement)
+    const liqFeeRate = takerFee / 100;
+    const liqFee = notionalValue * liqFeeRate;
+
+    const maintenanceMargin = (notionalValue * mmr) - maintenanceAmount + liqFee;
+    
+    const feeCost = entryFee; // Cost to open
+    const feeBuffer = feeCost * 0.1; // 10% buffer on entry fees
+    
+    // Funding Fee Calculation
+    // Funding is typically every 8 hours. 
+    // Estimated Funding = Notional Value * Funding Rate * (Hold Time / 8)
+    const fundingFee = notionalValue * (fundingRate / 100) * (expectedHoldHours / 8);
+    
+    const totalRequired = initialMargin + feeCost + feeBuffer + (fundingRate > 0 ? fundingFee : 0);
+    const canTakeTrade = totalRequired < balance;
 
     // Bankruptcy Price (price where loss = Initial Margin)
     const bankruptcyPrice = direction === 'LONG' 
       ? entryPrice - (initialMargin / quantity)
       : entryPrice + (initialMargin / quantity);
 
-    // Liquidation Price formulas (more accurate approximation for Isolated)
-    // For Long: Liq Price = Bankruptcy + (Maintenance Margin / Quantity)
-    // For Short: Liq Price = Bankruptcy - (Maintenance Margin / Quantity)
+    // Exact Isolated/Cross Margin Liquidation Price formulas
+    // For Long: Liq Price = (Entry Price * Quantity - MarginInPosition - Maintenance Amount + LiqFee) / (Quantity * (1 - MMR))
+    // For Short: Liq Price = (Entry Price * Quantity + MarginInPosition + Maintenance Amount - LiqFee) / (Quantity * (1 + MMR))
+    
+    // In Cross mode, MarginInPosition = Wallet Balance
+    // In Isolated mode, MarginInPosition = Initial Margin
+    const marginInPosition = marginMode === 'CROSS' ? balance : initialMargin;
+
     const liquidationPrice = direction === 'LONG'
-      ? bankruptcyPrice + (maintenanceMargin / quantity)
-      : bankruptcyPrice - (maintenanceMargin / quantity);
+      ? (entryPrice * quantity - marginInPosition - maintenanceAmount + liqFee) / (quantity * (1 - mmr))
+      : (entryPrice * quantity + marginInPosition + maintenanceAmount - liqFee) / (quantity * (1 + mmr));
 
     const simpleLiq = direction === 'LONG'
       ? entryPrice * (1 - 1 / leverage)
@@ -741,6 +1008,12 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate }:
 
     const pnlAtSL = direction === 'LONG' ? (stopLoss - entryPrice) * quantity : (entryPrice - stopLoss) * quantity;
     const pnlAtTP = takeProfit ? (direction === 'LONG' ? (takeProfit - entryPrice) * quantity : (entryPrice - takeProfit) * quantity) : 0;
+    
+    // Round trip fees (entry + exit) + funding
+    const estimatedTotalFees = entryFee + exitFee + fundingFee;
+    const netPnlAtSL = pnlAtSL - estimatedTotalFees;
+    const netPnlAtTP = pnlAtTP - estimatedTotalFees;
+
     const plannedRR = takeProfit ? Math.abs(takeProfit - entryPrice) / Math.abs(entryPrice - stopLoss) : 0;
 
     const suggestedTP2 = direction === 'LONG' ? entryPrice + (priceDiff * 2) : entryPrice - (priceDiff * 2);
@@ -842,9 +1115,19 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate }:
       optimalLeverage,
       maxSafeLeverage,
       rules,
-      qualityScore
+      qualityScore,
+      feeCost,
+      entryFee,
+      exitFee,
+      fundingFee,
+      estimatedTotalFees,
+      netPnlAtSL,
+      netPnlAtTP,
+      totalRequired,
+      canTakeTrade,
+      marginMode
     };
-  }, [balance, riskPercent, entryPrice, stopLoss, takeProfit, leverage, direction, symbol]);
+  }, [balance, riskPercent, entryPrice, stopLoss, takeProfit, leverage, direction, symbol, expectedHoldHours, fundingRate, makerFee, takerFee, entryFeeType, exitFeeType, marginMode]);
 
   const fetchPrice = async () => {
     setIsFetching(true);
@@ -905,6 +1188,27 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate }:
                 SHORT
               </button>
             </div>
+          </div>
+
+          <div className="flex bg-zinc-950 p-1 rounded-lg border border-zinc-800 mb-6">
+            <button 
+              onClick={() => setMarginMode('ISOLATED')}
+              className={cn(
+                "flex-1 py-1.5 rounded-md text-[10px] font-bold transition-all uppercase tracking-wider",
+                marginMode === 'ISOLATED' ? "bg-zinc-800 text-emerald-500 shadow-lg" : "text-zinc-600"
+              )}
+            >
+              Isolated
+            </button>
+            <button 
+              onClick={() => setMarginMode('CROSS')}
+              className={cn(
+                "flex-1 py-1.5 rounded-md text-[10px] font-bold transition-all uppercase tracking-wider",
+                marginMode === 'CROSS' ? "bg-zinc-800 text-emerald-500 shadow-lg" : "text-zinc-600"
+              )}
+            >
+              Cross
+            </button>
           </div>
 
           <div className="space-y-4">
@@ -982,6 +1286,91 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate }:
             </div>
 
             <div className="grid grid-cols-1 gap-4">
+              <div className="grid grid-cols-2 gap-4">
+                <div className="space-y-2">
+                  <label className="text-xs font-semibold text-zinc-500 uppercase flex items-center gap-1">
+                    Expected Hold (Hrs)
+                    <Clock className="w-3 h-3" />
+                  </label>
+                  <input 
+                    type="number"
+                    value={expectedHoldHours}
+                    onChange={(e) => setExpectedHoldHours(Number(e.target.value))}
+                    className="input-field w-full"
+                    min="0"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <label className="text-xs font-semibold text-zinc-500 uppercase flex items-center gap-1">
+                    Funding Rate (%)
+                    <Zap className="w-3 h-3 text-amber-500" />
+                  </label>
+                  <input 
+                    type="number"
+                    step="0.001"
+                    value={fundingRate}
+                    onChange={(e) => setFundingRate(Number(e.target.value))}
+                    className="input-field w-full"
+                  />
+                </div>
+              </div>
+
+              <div className="p-3 rounded-xl bg-zinc-950/30 border border-zinc-800 space-y-3">
+                <div className="flex items-center justify-between">
+                  <label className="text-[10px] font-bold text-zinc-500 uppercase tracking-wider">Fee Settings</label>
+                  <div className="flex gap-2">
+                    <div className="flex items-center gap-1">
+                      <span className="text-[9px] text-zinc-600 uppercase">Maker</span>
+                      <input 
+                        type="number" 
+                        step="0.001"
+                        value={makerFee}
+                        onChange={(e) => setMakerFee(Number(e.target.value))}
+                        className="w-12 bg-transparent border-b border-zinc-800 text-[10px] font-mono text-zinc-400 focus:outline-none focus:border-emerald-500"
+                      />
+                    </div>
+                    <div className="flex items-center gap-1">
+                      <span className="text-[9px] text-zinc-600 uppercase">Taker</span>
+                      <input 
+                        type="number" 
+                        step="0.001"
+                        value={takerFee}
+                        onChange={(e) => setTakerFee(Number(e.target.value))}
+                        className="w-12 bg-transparent border-b border-zinc-800 text-[10px] font-mono text-zinc-400 focus:outline-none focus:border-emerald-500"
+                      />
+                    </div>
+                  </div>
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="space-y-1">
+                    <span className="text-[9px] text-zinc-600 uppercase block">Entry Type</span>
+                    <div className="flex bg-zinc-950 rounded-md border border-zinc-800 p-0.5">
+                      <button 
+                        onClick={() => setEntryFeeType('MAKER')}
+                        className={cn("flex-1 text-[8px] font-bold py-1 rounded", entryFeeType === 'MAKER' ? "bg-zinc-800 text-emerald-500" : "text-zinc-600")}
+                      >MAKER</button>
+                      <button 
+                        onClick={() => setEntryFeeType('TAKER')}
+                        className={cn("flex-1 text-[8px] font-bold py-1 rounded", entryFeeType === 'TAKER' ? "bg-zinc-800 text-emerald-500" : "text-zinc-600")}
+                      >TAKER</button>
+                    </div>
+                  </div>
+                  <div className="space-y-1">
+                    <span className="text-[9px] text-zinc-600 uppercase block">Exit Type</span>
+                    <div className="flex bg-zinc-950 rounded-md border border-zinc-800 p-0.5">
+                      <button 
+                        onClick={() => setExitFeeType('MAKER')}
+                        className={cn("flex-1 text-[8px] font-bold py-1 rounded", exitFeeType === 'MAKER' ? "bg-zinc-800 text-emerald-500" : "text-zinc-600")}
+                      >MAKER</button>
+                      <button 
+                        onClick={() => setExitFeeType('TAKER')}
+                        className={cn("flex-1 text-[8px] font-bold py-1 rounded", exitFeeType === 'TAKER' ? "bg-zinc-800 text-emerald-500" : "text-zinc-600")}
+                      >TAKER</button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
               <div className="space-y-2">
                 <div className="flex justify-between items-center">
                   <label className="text-xs font-semibold text-zinc-500 uppercase">Entry Price</label>
@@ -993,6 +1382,28 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate }:
                     <RefreshCw className={cn("w-3 h-3", isFetching && "animate-spin")} />
                     Live Price
                   </button>
+                  <div className="relative">
+                    <button 
+                      onClick={() => fileInputRef.current?.click()}
+                      disabled={isScanning}
+                      className="text-[10px] flex items-center gap-1 text-amber-500 hover:underline disabled:opacity-50"
+                    >
+                      <Camera className={cn("w-3 h-3", isScanning && "animate-pulse")} />
+                      {isScanning ? "Scanning..." : "Scan Screenshot"}
+                    </button>
+                    {scanError && (
+                      <div className="absolute top-full right-0 mt-1 bg-rose-500 text-[8px] text-white px-2 py-0.5 rounded whitespace-nowrap z-10">
+                        {scanError}
+                      </div>
+                    )}
+                  </div>
+                  <input 
+                    type="file" 
+                    ref={fileInputRef} 
+                    onChange={handleScanScreenshot} 
+                    className="hidden" 
+                    accept="image/*" 
+                  />
                 </div>
                 <input 
                   type="number"
@@ -1028,7 +1439,7 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate }:
 
             <button 
               onClick={() => setIsModalOpen(true)}
-              disabled={!results}
+              disabled={!results || !results.canTakeTrade}
               className="btn-primary w-full mt-4 disabled:opacity-50 disabled:cursor-not-allowed"
             >
               <Plus className="w-5 h-5" />
@@ -1043,7 +1454,21 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate }:
         {results ? (
           <>
             {/* High Risk Warning Banner */}
-            {results.safetyBuffer < 2 && (
+            {!results.canTakeTrade && (
+              <div className="p-4 rounded-xl border bg-rose-500/10 border-rose-500/30 text-rose-500 flex items-start gap-4 mb-4 animate-bounce">
+                <div className="p-2 rounded-lg bg-rose-500/20 shrink-0">
+                  <AlertTriangle className="w-6 h-6" />
+                </div>
+                <div>
+                  <h4 className="font-bold text-sm uppercase tracking-wider mb-1">Trade Cannot Be Taken</h4>
+                  <p className="text-xs opacity-80 leading-relaxed">
+                    Required margin + fees (${results.totalRequired.toFixed(2)}) exceeds your available balance (${balance.toFixed(2)}). 
+                    Reduce your risk, leverage, or position size.
+                  </p>
+                </div>
+              </div>
+            )}
+            {results.safetyBuffer < 2 && results.canTakeTrade && (
               <div className={cn(
                 "p-4 rounded-xl border flex items-start gap-4 animate-pulse",
                 results.safetyBuffer < 1.5 
@@ -1105,6 +1530,34 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate }:
                   <div className="text-lg font-mono font-bold text-rose-500">-${results.riskAmount.toFixed(2)}</div>
                   <div className="text-[10px] text-rose-500/40 font-mono">≈ Rs. {(results.riskAmount * nprRate).toLocaleString()}</div>
                 </div>
+                <div className={cn(
+                  "p-4 rounded-xl border transition-all",
+                  results.canTakeTrade ? "bg-zinc-950/50 border-zinc-800/50" : "bg-rose-500/10 border-rose-500/50"
+                )}>
+                  <span className="text-[10px] text-zinc-500 uppercase font-bold block mb-1">Total Required (Margin+Fees)</span>
+                  <div className={cn("text-lg font-mono font-bold", !results.canTakeTrade ? "text-rose-500" : "text-zinc-100")}>
+                    ${results.totalRequired.toFixed(2)}
+                  </div>
+                  {!results.canTakeTrade && <div className="text-[10px] text-rose-500 font-bold uppercase mt-1">Insufficient Funds</div>}
+                </div>
+                <div className="p-4 rounded-xl bg-amber-500/5 border border-amber-500/20">
+                  <span className="text-[10px] text-amber-500/70 uppercase font-bold block mb-1">Est. Funding Cost</span>
+                  <div className="text-lg font-mono font-bold text-amber-500">${results.fundingFee.toFixed(4)}</div>
+                  <div className="text-[10px] text-zinc-600 mt-1">Based on {expectedHoldHours}h hold time</div>
+                </div>
+                <div className="p-4 rounded-xl bg-zinc-950/50 border border-zinc-800/50">
+                  <span className="text-[10px] text-zinc-500 uppercase font-bold block mb-1">Fee Breakdown</span>
+                  <div className="space-y-1">
+                    <div className="flex justify-between text-[10px]">
+                      <span className="text-zinc-600">Entry ({entryFeeType}):</span>
+                      <span className="text-zinc-400 font-mono">${results.entryFee.toFixed(2)}</span>
+                    </div>
+                    <div className="flex justify-between text-[10px]">
+                      <span className="text-zinc-600">Exit ({exitFeeType}):</span>
+                      <span className="text-zinc-400 font-mono">${results.exitFee.toFixed(2)}</span>
+                    </div>
+                  </div>
+                </div>
               </div>
 
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -1117,10 +1570,11 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate }:
                     <span className="text-sm font-mono font-bold text-zinc-100">{results.distToSL.toFixed(3)}%</span>
                   </div>
                   <div className="flex justify-between items-center">
-                    <span className="text-[10px] text-zinc-500 uppercase font-bold">PNL at SL</span>
+                    <span className="text-[10px] text-zinc-500 uppercase font-bold">Net PNL at SL</span>
                     <div className="text-right">
-                      <div className="text-sm font-mono font-bold text-rose-500">-${Math.abs(results.pnlAtSL).toFixed(2)}</div>
-                      <div className="text-[10px] text-rose-500/60 font-mono">≈ Rs. {(Math.abs(results.pnlAtSL) * nprRate).toLocaleString()}</div>
+                      <div className="text-sm font-mono font-bold text-rose-500">-${Math.abs(results.netPnlAtSL).toFixed(2)}</div>
+                      <div className="text-[10px] text-rose-500/60 font-mono">Incl. ${results.estimatedTotalFees.toFixed(2)} fees</div>
+                      <div className="text-[10px] text-rose-500/40 font-mono">≈ Rs. {(Math.abs(results.netPnlAtSL) * nprRate).toLocaleString()}</div>
                     </div>
                   </div>
                 </div>
@@ -1134,10 +1588,11 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate }:
                       </span>
                     </div>
                     <div className="flex justify-between items-center">
-                      <span className="text-[10px] text-zinc-500 uppercase font-bold">PNL at TP</span>
+                      <span className="text-[10px] text-zinc-500 uppercase font-bold">Net PNL at TP</span>
                       <div className="text-right">
-                        <div className="text-sm font-mono font-bold text-emerald-500">+${results.pnlAtTP.toFixed(2)}</div>
-                        <div className="text-[10px] text-emerald-500/60 font-mono">≈ Rs. {(results.pnlAtTP * nprRate).toLocaleString()}</div>
+                        <div className="text-sm font-mono font-bold text-emerald-500">+${results.netPnlAtTP.toFixed(2)}</div>
+                        <div className="text-[10px] text-emerald-500/60 font-mono">Incl. ${results.estimatedTotalFees.toFixed(2)} fees</div>
+                        <div className="text-[10px] text-emerald-500/40 font-mono">≈ Rs. {(results.netPnlAtTP * nprRate).toLocaleString()}</div>
                       </div>
                     </div>
                   </div>
@@ -1180,7 +1635,7 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate }:
                   <div className={cn("text-xl font-mono font-bold", getSafetyColor(results.safetyBuffer))}>
                     ${results.liquidationPrice.toFixed(results.liquidationPrice < 1 ? 6 : 2)}
                   </div>
-                  <div className="text-[10px] text-zinc-600 mt-1">MMR-adjusted (isolated)</div>
+                  <div className="text-[10px] text-zinc-600 mt-1">MMR-adjusted (isolated). Estimated; triggered by Mark Price.</div>
                 </div>
                 <div className="p-4 rounded-xl bg-rose-500/5 border border-rose-500/20">
                   <span className="text-[10px] text-rose-500/70 uppercase font-bold block mb-1">Bankruptcy Price</span>
@@ -1443,6 +1898,8 @@ const LogTradeModal = ({ results, symbol, direction, leverage, entryPrice, stopL
       marketCondition,
       tags,
       status: 'OPEN',
+      marginMode: results.marginMode,
+      addedMargin: 0,
       plannedRR: results.plannedRR,
       balanceBefore: currentBalance,
       safetyBufferAtEntry: results.safetyBuffer,
@@ -1692,6 +2149,7 @@ const LogTradeModal = ({ results, symbol, direction, leverage, entryPrice, stopL
 
 const CloseTradeModal = ({ trade, onClose, onSave }: { trade: Trade, onClose: () => void, onSave: (data: Partial<Trade>) => void }) => {
   const [exitPrice, setExitPrice] = useState(trade.exitPrice?.toString() || '');
+  const [expectedExitPrice, setExpectedExitPrice] = useState(trade.takeProfit?.toString() || '');
   const [fees, setFees] = useState('0.5');
   const [highestPrice, setHighestPrice] = useState('');
   const [lowestPrice, setLowestPrice] = useState('');
@@ -1724,6 +2182,7 @@ const CloseTradeModal = ({ trade, onClose, onSave }: { trade: Trade, onClose: ()
     const exit = parseFloat(exitPrice);
     if (isNaN(exit)) return;
 
+    const expectedExit = parseFloat(expectedExitPrice) || exit;
     const high = parseFloat(highestPrice) || exit;
     const low = parseFloat(lowestPrice) || exit;
     const totalFees = parseFloat(fees) || 0;
@@ -1738,6 +2197,18 @@ const CloseTradeModal = ({ trade, onClose, onSave }: { trade: Trade, onClose: ()
 
     if (!metrics) return;
 
+    // Slippage Calculations
+    const entrySlippageUsdt = trade.direction === 'LONG'
+      ? (trade.entryPrice - (trade.expectedEntryPrice || trade.entryPrice)) * trade.quantity
+      : ((trade.expectedEntryPrice || trade.entryPrice) - trade.entryPrice) * trade.quantity;
+    
+    const exitSlippageUsdt = trade.direction === 'LONG'
+      ? (expectedExit - exit) * trade.quantity
+      : (exit - expectedExit) * trade.quantity;
+
+    const totalSlippageUsdt = entrySlippageUsdt + exitSlippageUsdt;
+    const slippagePercent = (totalSlippageUsdt / trade.notionalValue) * 100;
+
     // MFE / MAE Percent Calculations
     const mfePercent = trade.direction === 'LONG'
       ? ((high - trade.entryPrice) / trade.entryPrice) * 100
@@ -1750,12 +2221,15 @@ const CloseTradeModal = ({ trade, onClose, onSave }: { trade: Trade, onClose: ()
     onSave({
       status: 'CLOSED',
       exitPrice: exit,
+      expectedExitPrice: expectedExit,
       highestPriceReached: high,
       lowestPriceReached: low,
       mfeUsdt: trade.direction === 'LONG' ? (high - trade.entryPrice) * trade.quantity : (trade.entryPrice - low) * trade.quantity,
       maeUsdt: trade.direction === 'LONG' ? (trade.entryPrice - low) * trade.quantity : (high - trade.entryPrice) * trade.quantity,
       mfePercent,
       maePercent,
+      slippageUsdt: totalSlippageUsdt,
+      slippagePercent,
       pnl: metrics.pnl,
       fees: totalFees,
       netPnl: metrics.netPnl,
@@ -1836,6 +2310,19 @@ const CloseTradeModal = ({ trade, onClose, onSave }: { trade: Trade, onClose: ()
               />
             </div>
             <div className="space-y-2">
+              <label className="text-xs font-semibold text-zinc-500 uppercase">Planned Exit (for Slippage)</label>
+              <input 
+                type="number"
+                value={expectedExitPrice}
+                onChange={(e) => setExpectedExitPrice(e.target.value)}
+                className="input-field w-full text-lg font-mono"
+                placeholder="0.00"
+              />
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 gap-4">
+            <div className="space-y-2">
               <label className="text-xs font-semibold text-zinc-500 uppercase">Total Fees (USDT)</label>
               <input 
                 type="number"
@@ -1843,6 +2330,19 @@ const CloseTradeModal = ({ trade, onClose, onSave }: { trade: Trade, onClose: ()
                 onChange={(e) => setFees(e.target.value)}
                 className="input-field w-full text-lg font-mono"
               />
+            </div>
+            <div className="p-3 bg-zinc-950 rounded-xl border border-zinc-800 flex flex-col justify-center">
+              <span className="text-[10px] text-zinc-500 uppercase block mb-1">Est. Slippage</span>
+              <div className={cn("text-sm font-mono font-bold", (parseFloat(expectedExitPrice) || 0) !== parseFloat(exitPrice) ? "text-rose-500" : "text-zinc-500")}>
+                {(() => {
+                  const exit = parseFloat(exitPrice);
+                  const expected = parseFloat(expectedExitPrice) || exit;
+                  if (isNaN(exit)) return '0.00%';
+                  const sUsdt = trade.direction === 'LONG' ? (expected - exit) * trade.quantity : (exit - expected) * trade.quantity;
+                  const sPct = (sUsdt / trade.notionalValue) * 100;
+                  return `${sPct.toFixed(2)}%`;
+                })()}
+              </div>
             </div>
           </div>
 
@@ -1995,11 +2495,13 @@ const EditTradeModal = ({ trade, onClose, onSave }: { trade: Trade, onClose: () 
   const [marketCondition, setMarketCondition] = useState(trade.marketCondition);
   const [tags, setTags] = useState<string[]>(trade.tags || []);
   const [tagInput, setTagInput] = useState('');
+  const [marginMode, setMarginMode] = useState<'ISOLATED' | 'CROSS'>(trade.marginMode || 'ISOLATED');
   const [entryImage1h, setEntryImage1h] = useState<string | null>(trade.entryImage1h || null);
   const [exitImage5min, setExitImage5min] = useState<string | null>(trade.exitImage5min || null);
   
   // For CLOSED trades
   const [exitPrice, setExitPrice] = useState(trade.exitPrice?.toString() || '');
+  const [expectedExitPrice, setExpectedExitPrice] = useState(trade.expectedExitPrice?.toString() || trade.takeProfit?.toString() || '');
   const [fees, setFees] = useState(trade.fees?.toString() || '0');
   const [highestPrice, setHighestPrice] = useState(trade.highestPriceReached?.toString() || '');
   const [lowestPrice, setLowestPrice] = useState(trade.lowestPriceReached?.toString() || '');
@@ -2056,6 +2558,7 @@ const EditTradeModal = ({ trade, onClose, onSave }: { trade: Trade, onClose: () 
       emotion,
       marketCondition,
       tags,
+      marginMode,
       entryImage1h: entryImage1h || undefined,
       exitImage5min: exitImage5min || undefined,
     };
@@ -2075,6 +2578,7 @@ const EditTradeModal = ({ trade, onClose, onSave }: { trade: Trade, onClose: () 
       });
 
       if (metrics) {
+        const expectedExit = parseFloat(expectedExitPrice) || exit;
         const mfePercent = trade.direction === 'LONG'
           ? ((high - trade.entryPrice) / trade.entryPrice) * 100
           : ((trade.entryPrice - low) / trade.entryPrice) * 100;
@@ -2083,9 +2587,22 @@ const EditTradeModal = ({ trade, onClose, onSave }: { trade: Trade, onClose: () 
           ? ((trade.entryPrice - low) / trade.entryPrice) * 100
           : ((high - trade.entryPrice) / trade.entryPrice) * 100;
 
+        // Slippage Calculations
+        const entrySlippageUsdt = trade.direction === 'LONG'
+          ? (trade.entryPrice - (trade.expectedEntryPrice || trade.entryPrice)) * trade.quantity
+          : ((trade.expectedEntryPrice || trade.entryPrice) - trade.entryPrice) * trade.quantity;
+        
+        const exitSlippageUsdt = trade.direction === 'LONG'
+          ? (expectedExit - exit) * trade.quantity
+          : (exit - expectedExit) * trade.quantity;
+
+        const totalSlippageUsdt = entrySlippageUsdt + exitSlippageUsdt;
+        const slippagePercent = (totalSlippageUsdt / trade.notionalValue) * 100;
+
         updatedTrade = {
           ...updatedTrade,
           exitPrice: exit,
+          expectedExitPrice: expectedExit,
           fees: totalFees,
           highestPriceReached: high,
           lowestPriceReached: low,
@@ -2097,6 +2614,8 @@ const EditTradeModal = ({ trade, onClose, onSave }: { trade: Trade, onClose: () 
           maeUsdt: trade.direction === 'LONG' ? (trade.entryPrice - low) * trade.quantity : (high - trade.entryPrice) * trade.quantity,
           mfePercent,
           maePercent,
+          slippageUsdt: totalSlippageUsdt,
+          slippagePercent,
           exitRationale,
           postTradeReflection: postReflection,
           followedPlan,
@@ -2166,6 +2685,29 @@ const EditTradeModal = ({ trade, onClose, onSave }: { trade: Trade, onClose: () 
                 </select>
               </div>
               <div className="space-y-2">
+                <label className="text-xs font-semibold text-zinc-500 uppercase">Margin Mode</label>
+                <div className="flex bg-zinc-950 p-1 rounded-xl border border-zinc-800">
+                  <button 
+                    onClick={() => setMarginMode('ISOLATED')}
+                    className={cn(
+                      "flex-1 py-2 text-xs font-bold rounded-lg transition-all",
+                      marginMode === 'ISOLATED' ? "bg-amber-500/10 text-amber-500 shadow-sm" : "text-zinc-500 hover:text-zinc-300"
+                    )}
+                  >
+                    Isolated
+                  </button>
+                  <button 
+                    onClick={() => setMarginMode('CROSS')}
+                    className={cn(
+                      "flex-1 py-2 text-xs font-bold rounded-lg transition-all",
+                      marginMode === 'CROSS' ? "bg-blue-500/10 text-blue-500 shadow-sm" : "text-zinc-500 hover:text-zinc-300"
+                    )}
+                  >
+                    Cross
+                  </button>
+                </div>
+              </div>
+              <div className="space-y-2">
                 <label className="text-xs font-semibold text-zinc-500 uppercase">Emotion</label>
                 <select 
                   value={emotion}
@@ -2223,6 +2765,17 @@ const EditTradeModal = ({ trade, onClose, onSave }: { trade: Trade, onClose: () 
                   />
                 </div>
                 <div className="space-y-2">
+                  <label className="text-xs font-semibold text-zinc-500 uppercase">Planned Exit (for Slippage)</label>
+                  <input 
+                    type="number"
+                    value={expectedExitPrice}
+                    onChange={(e) => setExpectedExitPrice(e.target.value)}
+                    className="input-field w-full font-mono"
+                  />
+                </div>
+              </div>
+              <div className="grid grid-cols-2 gap-4">
+                <div className="space-y-2">
                   <label className="text-xs font-semibold text-zinc-500 uppercase">Fees (USDT)</label>
                   <input 
                     type="number"
@@ -2230,6 +2783,19 @@ const EditTradeModal = ({ trade, onClose, onSave }: { trade: Trade, onClose: () 
                     onChange={(e) => setFees(e.target.value)}
                     className="input-field w-full font-mono"
                   />
+                </div>
+                <div className="p-3 bg-zinc-950 rounded-xl border border-zinc-800 flex flex-col justify-center">
+                  <span className="text-[10px] text-zinc-500 uppercase block mb-1">Est. Slippage</span>
+                  <div className={cn("text-sm font-mono font-bold", (parseFloat(expectedExitPrice) || 0) !== parseFloat(exitPrice) ? "text-rose-500" : "text-zinc-500")}>
+                    {(() => {
+                      const exit = parseFloat(exitPrice);
+                      const expected = parseFloat(expectedExitPrice) || exit;
+                      if (isNaN(exit)) return '0.00%';
+                      const sUsdt = trade.direction === 'LONG' ? (expected - exit) * trade.quantity : (exit - expected) * trade.quantity;
+                      const sPct = (sUsdt / trade.notionalValue) * 100;
+                      return `${sPct.toFixed(2)}%`;
+                    })()}
+                  </div>
                 </div>
               </div>
               <div className="grid grid-cols-2 gap-4">
@@ -2358,6 +2924,78 @@ const EditTradeModal = ({ trade, onClose, onSave }: { trade: Trade, onClose: () 
   );
 };
 
+const AddMarginModal = ({ trade, onClose, onSave }: { trade: Trade, onClose: () => void, onSave: (updated: Trade) => void }) => {
+  const [amount, setAmount] = useState<string>('');
+  
+  const handleSave = () => {
+    const val = parseFloat(amount);
+    if (isNaN(val) || val <= 0) return;
+    
+    const updated: Trade = {
+      ...trade,
+      addedMargin: (trade.addedMargin || 0) + val
+    };
+    onSave(updated);
+    onClose();
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-zinc-950/80 backdrop-blur-sm">
+      <motion.div 
+        initial={{ opacity: 0, scale: 0.95 }}
+        animate={{ opacity: 1, scale: 1 }}
+        className="bg-zinc-900 border border-zinc-800 rounded-2xl w-full max-w-sm shadow-2xl overflow-hidden"
+      >
+        <div className="p-6 border-b border-zinc-800 flex items-center justify-between">
+          <h2 className="text-lg font-bold flex items-center gap-2">
+            <PlusCircle className="w-5 h-5 text-emerald-500" />
+            Add Margin: {trade.symbol}
+          </h2>
+          <button onClick={onClose} className="text-zinc-500 hover:text-zinc-100">
+            <RefreshCw className="w-5 h-5 rotate-45" />
+          </button>
+        </div>
+        <div className="p-6 space-y-4">
+          <div className="p-4 bg-zinc-950 rounded-xl border border-zinc-800 space-y-2">
+            <div className="flex justify-between text-[10px] uppercase font-bold text-zinc-500">
+              <span>Current Margin</span>
+              <span className="text-zinc-100">${(trade.initialMargin + (trade.addedMargin || 0)).toFixed(2)}</span>
+            </div>
+            <div className="flex justify-between text-[10px] uppercase font-bold text-zinc-500">
+              <span>Mode</span>
+              <span className="text-emerald-500">{trade.marginMode}</span>
+            </div>
+          </div>
+          <div className="space-y-2">
+            <label className="text-xs font-semibold text-zinc-500 uppercase tracking-wider">Amount to Add (USDT)</label>
+            <input 
+              type="number"
+              value={amount}
+              onChange={(e) => setAmount(e.target.value)}
+              className="input-field w-full text-lg font-mono"
+              placeholder="0.00"
+              autoFocus
+            />
+          </div>
+          <p className="text-[10px] text-zinc-500 italic">
+            Adding margin will lower your liquidation price for LONGs or raise it for SHORTs.
+          </p>
+        </div>
+        <div className="p-6 bg-zinc-950/50 border-t border-zinc-800 flex gap-3">
+          <button onClick={onClose} className="btn-secondary flex-1">Cancel</button>
+          <button 
+            onClick={handleSave} 
+            disabled={!amount || parseFloat(amount) <= 0}
+            className="btn-primary flex-1 disabled:opacity-50"
+          >
+            Confirm
+          </button>
+        </div>
+      </motion.div>
+    </div>
+  );
+};
+
 const JournalTab = ({ 
   trades, 
   setTrades, 
@@ -2372,7 +3010,9 @@ const JournalTab = ({
   setEditingTrade,
   exportData, 
   importData, 
-  clearData 
+  importBinanceCSV,
+  clearData,
+  setActiveTab
 }: any) => {
   const [search, setSearch] = useState('');
   const [filterDirection, setFilterDirection] = useState<string>('ALL');
@@ -2383,6 +3023,7 @@ const JournalTab = ({
   const [reviewTrade, setReviewTrade] = useState<Trade | null>(null);
   const [closingTrade, setClosingTrade] = useState<Trade | null>(null);
   const [editingPnlTrade, setEditingPnlTrade] = useState<Trade | null>(null);
+  const [addingMarginTrade, setAddingMarginTrade] = useState<Trade | null>(null);
   const [editedPnl, setEditedPnl] = useState<string>('');
   const [editedFees, setEditedFees] = useState<string>('');
   const [selectedTrades, setSelectedTrades] = useState<string[]>([]);
@@ -2875,6 +3516,20 @@ const JournalTab = ({
                         <span className="font-bold text-blue-500">{reviewTrade.actualRR?.toFixed(2) || '—'}</span>
                       </div>
                     </div>
+                    <div className="pt-3 border-t border-zinc-800/50 space-y-2">
+                      <div className="flex justify-between items-center text-[10px]">
+                        <span className="text-zinc-500 uppercase">Total Slippage</span>
+                        <span className={cn("font-bold", (reviewTrade.slippagePercent || 0) > 0.1 ? "text-rose-500" : "text-zinc-400")}>
+                          {reviewTrade.slippagePercent?.toFixed(2)}% (${reviewTrade.slippageUsdt?.toFixed(2)})
+                        </span>
+                      </div>
+                      <div className="flex justify-between items-center text-[10px]">
+                        <span className="text-zinc-500 uppercase">MFE / MAE</span>
+                        <span className="font-bold text-zinc-300">
+                          +{reviewTrade.mfePercent?.toFixed(2)}% / -{reviewTrade.maePercent?.toFixed(2)}%
+                        </span>
+                      </div>
+                    </div>
                   </div>
                 </div>
               </div>
@@ -3012,6 +3667,23 @@ const JournalTab = ({
                 <Upload className="w-4 h-4" />
                 <input type="file" className="hidden" onChange={importData} accept=".json" />
               </label>
+              <label className="btn-secondary p-2 cursor-pointer border-amber-500/30 text-amber-500 hover:bg-amber-500/10" title="Import Binance CSV">
+                <div className="flex items-center gap-1">
+                  <FileText className="w-4 h-4" />
+                  <span className="text-[10px] font-bold hidden md:inline">BINANCE</span>
+                </div>
+                <input type="file" className="hidden" onChange={importBinanceCSV} accept=".csv" />
+              </label>
+              <button 
+                onClick={() => setActiveTab('calculator')} 
+                className="btn-secondary p-2 text-blue-500 hover:bg-blue-500/10" 
+                title="Scan Screenshot in Calculator"
+              >
+                <div className="flex items-center gap-1">
+                  <Camera className="w-4 h-4" />
+                  <span className="text-[10px] font-bold hidden md:inline">SCAN</span>
+                </div>
+              </button>
               <button onClick={clearData} className="btn-secondary p-2 text-rose-500 hover:bg-rose-500/10" title="DANGER: Clear All Data">
                 <AlertTriangle className="w-4 h-4" />
               </button>
@@ -3036,8 +3708,76 @@ const JournalTab = ({
         )}
       </div>
 
-      {/* Trade Table */}
-      <div className="crypto-card p-0 overflow-hidden border-zinc-800/50">
+      {/* Trade List - Mobile Card View */}
+      <div className="grid grid-cols-1 gap-4 md:hidden">
+        {filteredTrades.map((t: Trade) => (
+          <div 
+            key={t.id} 
+            className="crypto-card bg-zinc-900/50 border-zinc-800/50 p-4 space-y-3"
+            onClick={() => setReviewTrade(t)}
+          >
+            <div className="flex justify-between items-start">
+              <div className="flex items-center gap-2">
+                <div className={cn("w-2 h-2 rounded-full", t.direction === 'LONG' ? "bg-emerald-500" : "bg-rose-500")} />
+                <div>
+                  <div className="text-sm font-bold text-zinc-100">{t.symbol}</div>
+                  <div className="text-[10px] text-zinc-500">{format(new Date(t.date), 'MMM dd, HH:mm')}</div>
+                </div>
+              </div>
+              <div className={cn("px-2 py-0.5 rounded text-[10px] font-bold", 
+                t.status === 'OPEN' ? "bg-blue-500/10 text-blue-500" : "bg-zinc-800 text-zinc-400"
+              )}>
+                {t.status}
+              </div>
+            </div>
+
+            <div className="grid grid-cols-3 gap-2 py-2 border-y border-zinc-800/50">
+              <div>
+                <span className="text-[8px] text-zinc-500 uppercase block">Entry</span>
+                <span className="text-xs font-mono text-zinc-300">${t.entryPrice.toLocaleString()}</span>
+              </div>
+              <div>
+                <span className="text-[8px] text-zinc-500 uppercase block">Size</span>
+                <span className="text-xs font-mono text-zinc-300">{t.quantity}</span>
+              </div>
+              <div>
+                <span className="text-[8px] text-zinc-500 uppercase block">PNL</span>
+                <span className={cn("text-xs font-mono font-bold", (t.netPnl || 0) >= 0 ? "text-emerald-500" : "text-rose-500")}>
+                  {t.status === 'CLOSED' ? `$${t.netPnl.toFixed(2)}` : '—'}
+                </span>
+              </div>
+            </div>
+
+            <div className="flex justify-between items-center pt-1">
+              <div className="flex gap-1">
+                {t.tags.slice(0, 2).map(tag => (
+                  <span key={tag} className="text-[8px] px-1.5 py-0.5 bg-zinc-800 text-zinc-500 rounded-full">{tag}</span>
+                ))}
+              </div>
+              <div className="flex gap-2">
+                <button 
+                  onClick={(e) => { e.stopPropagation(); setEditingTrade(t); }}
+                  className="p-1.5 text-zinc-500 hover:text-zinc-100"
+                >
+                  <Edit3 className="w-3.5 h-3.5" />
+                </button>
+                <button 
+                  onClick={(e) => { e.stopPropagation(); deleteTrade(t.id); }}
+                  className="p-1.5 text-zinc-500 hover:text-rose-500"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            </div>
+          </div>
+        ))}
+        {filteredTrades.length === 0 && (
+          <div className="text-center py-12 text-zinc-500 text-sm">No trades found.</div>
+        )}
+      </div>
+
+      {/* Trade Table (Desktop) */}
+      <div className="crypto-card p-0 overflow-hidden border-zinc-800/50 hidden md:block">
         <div className="overflow-x-auto">
           <table className="w-full text-left border-collapse">
             <thead>
@@ -3088,7 +3828,7 @@ const JournalTab = ({
                     PNL {sortField === 'netPnl' ? (sortDirection === 'asc' ? <ChevronDown className="w-3 h-3 rotate-180" /> : <ChevronDown className="w-3 h-3" />) : <ArrowUpDown className="w-3 h-3 opacity-30" />}
                   </div>
                 </th>
-                <th className="px-4 py-4 text-[10px] font-bold text-zinc-500 uppercase">Eff%</th>
+                <th className="px-4 py-4 text-[10px] font-bold text-zinc-500 uppercase">Eff% / Slip</th>
                 <th className="px-4 py-4 text-[10px] font-bold text-zinc-500 uppercase">Media</th>
                 <th className="px-4 py-4 text-[10px] font-bold text-zinc-500 uppercase text-right">Actions</th>
               </tr>
@@ -3123,6 +3863,11 @@ const JournalTab = ({
                           {t.direction}
                         </span>
                         <span className="text-[10px] text-zinc-500 font-mono">{t.leverage}x</span>
+                        <span className={cn("text-[9px] font-bold px-1 rounded border", 
+                          t.marginMode === 'ISOLATED' ? "border-amber-500/30 text-amber-500" : "border-blue-500/30 text-blue-500"
+                        )}>
+                          {t.marginMode === 'ISOLATED' ? 'ISO' : 'CROSS'}
+                        </span>
                       </div>
                     </div>
                   </td>
@@ -3192,14 +3937,21 @@ const JournalTab = ({
                   </td>
                   <td className="px-4 py-4">
                     {t.status === 'CLOSED' ? (
-                      <div className="flex items-center gap-2">
-                        <span className="text-xs font-mono font-bold text-zinc-100">{t.exitEfficiency?.toFixed(0)}%</span>
-                        <div className="w-12 h-1.5 bg-zinc-800 rounded-full overflow-hidden hidden md:block">
-                          <div 
-                            className="h-full bg-emerald-500" 
-                            style={{ width: `${Math.min(100, t.exitEfficiency || 0)}%` }} 
-                          />
+                      <div className="flex flex-col gap-1">
+                        <div className="flex items-center gap-2">
+                          <span className="text-xs font-mono font-bold text-zinc-100">{t.exitEfficiency?.toFixed(0)}%</span>
+                          <div className="w-12 h-1.5 bg-zinc-800 rounded-full overflow-hidden hidden md:block">
+                            <div 
+                              className="h-full bg-emerald-500" 
+                              style={{ width: `${Math.min(100, t.exitEfficiency || 0)}%` }} 
+                            />
+                          </div>
                         </div>
+                        {t.slippagePercent !== undefined && (
+                          <span className={cn("text-[9px] font-mono", t.slippagePercent > 0.1 ? "text-rose-500" : "text-zinc-500")}>
+                            Slip: {t.slippagePercent.toFixed(2)}%
+                          </span>
+                        )}
                       </div>
                     ) : (
                       <span className="text-xs text-zinc-500">—</span>
@@ -3235,13 +3987,24 @@ const JournalTab = ({
                   <td className="px-4 py-4 text-right">
                     <div className="flex items-center justify-end gap-3">
                       {t.status === 'OPEN' && (
-                        <button 
-                          onClick={() => setClosingTrade(t)}
-                          className="text-emerald-500 hover:text-emerald-400 transition-colors"
-                          title="Close Trade"
-                        >
-                          <CheckCircle2 className="w-4 h-4" />
-                        </button>
+                        <>
+                          <button 
+                            onClick={() => setClosingTrade(t)}
+                            className="text-emerald-500 hover:text-emerald-400 transition-colors"
+                            title="Close Trade"
+                          >
+                            <CheckCircle2 className="w-4 h-4" />
+                          </button>
+                          {t.marginMode === 'ISOLATED' && (
+                            <button 
+                              onClick={() => setAddingMarginTrade(t)}
+                              className="text-amber-500 hover:text-amber-400 transition-colors"
+                              title="Add Margin"
+                            >
+                              <PlusCircle className="w-4 h-4" />
+                            </button>
+                          )}
+                        </>
                       )}
                       <button 
                         onClick={() => setEditingTrade(t)}
@@ -3365,6 +4128,14 @@ const JournalTab = ({
             </div>
           </div>
         </div>
+      )}
+
+      {addingMarginTrade && (
+        <AddMarginModal 
+          trade={addingMarginTrade}
+          onClose={() => setAddingMarginTrade(null)}
+          onSave={onUpdateTrade}
+        />
       )}
 
       {/* Performance Dashboard */}
@@ -3754,6 +4525,65 @@ const StatsTab = ({ trades, startingBalance, balanceHistory }: any) => {
     const avgMfe = closed.reduce((acc, t) => acc + (t.mfePercent || 0), 0) / closed.length;
     const avgMae = closed.reduce((acc, t) => acc + (t.maePercent || 0), 0) / closed.length;
 
+    // Funding Cost Summary
+    const totalFundingFees = closed.reduce((acc, t) => acc + (t.fundingFee || 0), 0);
+
+    // Win rate by market regime
+    const regimeStats: Record<string, { wins: number, total: number }> = {};
+    closed.forEach(t => {
+      const regime = t.marketCondition || 'UNKNOWN';
+      if (!regimeStats[regime]) regimeStats[regime] = { wins: 0, total: 0 };
+      regimeStats[regime].total++;
+      if (t.netPnl > 0) regimeStats[regime].wins++;
+    });
+
+    // Psychological Metrics
+    const emotionStats: Record<string, { wins: number, total: number, pnl: number }> = {};
+    closed.forEach(t => {
+      const emotion = t.emotion || 'NEUTRAL';
+      if (!emotionStats[emotion]) emotionStats[emotion] = { wins: 0, total: 0, pnl: 0 };
+      emotionStats[emotion].total++;
+      emotionStats[emotion].pnl += t.netPnl;
+      if (t.netPnl > 0) emotionStats[emotion].wins++;
+    });
+
+    const revengeTradeStats = {
+      total: closed.filter(t => t.isRevengeTrade).length,
+      wins: closed.filter(t => t.isRevengeTrade && t.netPnl > 0).length,
+      pnl: closed.filter(t => t.isRevengeTrade).reduce((acc, t) => acc + t.netPnl, 0)
+    };
+
+    // Time of day performance
+    const hourlyStats: Record<number, { wins: number, total: number }> = {};
+    closed.forEach(t => {
+      const hour = new Date(t.date).getHours();
+      if (!hourlyStats[hour]) hourlyStats[hour] = { wins: 0, total: 0 };
+      hourlyStats[hour].total++;
+      if (t.netPnl > 0) hourlyStats[hour].wins++;
+    });
+
+    const hourlyData = Array.from({ length: 24 }, (_, i) => ({
+      hour: i,
+      winRate: hourlyStats[i] ? (hourlyStats[i].wins / hourlyStats[i].total) * 100 : 0,
+      total: hourlyStats[i]?.total || 0
+    }));
+
+    // Monte Carlo Simulation (20 paths, 30 trades into future)
+    const monteCarloPaths: any[] = [];
+    if (closed.length >= 5) {
+      const pnlResults = closed.map(t => t.netPnl);
+      for (let i = 0; i < 20; i++) {
+        let currentPathBalance = balanceHistory[balanceHistory.length - 1]?.amount || startingBalance;
+        const path = [{ name: 'Now', balance: currentPathBalance }];
+        for (let j = 1; j <= 30; j++) {
+          const randomPnl = pnlResults[Math.floor(Math.random() * pnlResults.length)];
+          currentPathBalance += randomPnl;
+          path.push({ name: `T+${j}`, balance: currentPathBalance });
+        }
+        monteCarloPaths.push(path);
+      }
+    }
+
     // Win rate by strategy
     const strategyStats: Record<string, { wins: number, total: number }> = {};
     closed.forEach(t => {
@@ -3791,6 +4621,12 @@ const StatsTab = ({ trades, startingBalance, balanceHistory }: any) => {
       avgMfe,
       avgMae,
       strategyStats,
+      regimeStats,
+      emotionStats,
+      revengeTradeStats,
+      hourlyData,
+      monteCarloPaths,
+      totalFundingFees,
       monthlyData,
       equityData,
       totalTrades: closed.length
@@ -3809,7 +4645,7 @@ const StatsTab = ({ trades, startingBalance, balanceHistory }: any) => {
   return (
     <div className="space-y-8 animate-in fade-in duration-500">
       {/* Top Stats Grid */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4">
         <div className="crypto-card">
           <span className="text-[10px] text-zinc-500 uppercase font-bold tracking-wider">Win Rate</span>
           <div className="text-2xl font-mono font-bold text-emerald-500 mt-1">{stats.winRate.toFixed(1)}%</div>
@@ -3831,6 +4667,11 @@ const StatsTab = ({ trades, startingBalance, balanceHistory }: any) => {
           <span className="text-[10px] text-zinc-500 uppercase font-bold tracking-wider">Avg Efficiency</span>
           <div className="text-2xl font-mono font-bold text-amber-500 mt-1">{stats.avgEfficiency.toFixed(1)}%</div>
           <div className="text-[10px] text-zinc-500 mt-1">MFE: {stats.avgMfe.toFixed(1)}% | MAE: {stats.avgMae.toFixed(1)}%</div>
+        </div>
+        <div className="crypto-card">
+          <span className="text-[10px] text-zinc-500 uppercase font-bold tracking-wider">Total Funding</span>
+          <div className="text-2xl font-mono font-bold text-amber-500 mt-1">-${stats.totalFundingFees.toFixed(2)}</div>
+          <div className="text-[10px] text-zinc-500 mt-1">{( (stats.totalFundingFees / (stats.totalFees || 1)) * 100 ).toFixed(1)}% of total fees</div>
         </div>
       </div>
 
@@ -3926,6 +4767,135 @@ const StatsTab = ({ trades, startingBalance, balanceHistory }: any) => {
               </div>
             );
           })}
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        {/* Market Regime Analysis */}
+        <div className="crypto-card p-6">
+          <h3 className="text-sm font-bold uppercase text-zinc-500 mb-6 flex items-center gap-2">
+            <Activity className="w-4 h-4" /> Market Regime Analysis
+          </h3>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            {Object.entries(stats.regimeStats).map(([regime, data]: [string, any]) => {
+              const wr = (data.wins / data.total) * 100;
+              return (
+                <div key={regime} className="p-4 bg-zinc-950 rounded-xl border border-zinc-800">
+                  <div className="flex justify-between items-center mb-2">
+                    <span className="text-xs font-bold text-zinc-200">{regime}</span>
+                    <span className={cn("text-xs font-bold", wr >= 50 ? "text-emerald-500" : "text-rose-500")}>
+                      {wr.toFixed(1)}%
+                    </span>
+                  </div>
+                  <div className="h-1.5 bg-zinc-900 rounded-full overflow-hidden">
+                    <div className={cn("h-full", wr >= 50 ? "bg-emerald-500" : "bg-rose-500")} style={{ width: `${wr}%` }} />
+                  </div>
+                  <div className="mt-2 flex justify-between text-[10px] text-zinc-500">
+                    <span>{data.total} trades</span>
+                    <span>{data.wins}W - {data.total - data.wins}L</span>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* Psychological Metrics */}
+        <div className="crypto-card p-6">
+          <h3 className="text-sm font-bold uppercase text-zinc-500 mb-6 flex items-center gap-2">
+            <Brain className="w-4 h-4" /> Psychological Metrics
+          </h3>
+          <div className="space-y-4">
+            <div className="grid grid-cols-2 gap-4">
+              <div className="p-3 bg-zinc-950 rounded-xl border border-zinc-800">
+                <span className="text-[10px] text-zinc-500 uppercase block mb-1">Revenge Trades</span>
+                <div className="text-xl font-mono font-bold text-rose-500">{stats.revengeTradeStats.total}</div>
+                <div className="text-[10px] text-rose-500/60 font-mono">PNL: ${stats.revengeTradeStats.pnl.toFixed(2)}</div>
+              </div>
+              <div className="p-3 bg-zinc-950 rounded-xl border border-zinc-800">
+                <span className="text-[10px] text-zinc-500 uppercase block mb-1">Revenge Win Rate</span>
+                <div className="text-xl font-mono font-bold text-zinc-100">
+                  {stats.revengeTradeStats.total > 0 ? ((stats.revengeTradeStats.wins / stats.revengeTradeStats.total) * 100).toFixed(1) : '0'}%
+                </div>
+              </div>
+            </div>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              {Object.entries(stats.emotionStats).map(([emotion, data]: [string, any]) => (
+                <div key={emotion} className="flex items-center justify-between p-2 bg-zinc-950/50 rounded-lg border border-zinc-800/50">
+                  <span className="text-xs text-zinc-400 capitalize">{emotion.toLowerCase()}</span>
+                  <div className="text-right">
+                    <div className={cn("text-xs font-mono font-bold", data.pnl >= 0 ? "text-emerald-500" : "text-rose-500")}>
+                      {data.pnl >= 0 ? '+' : ''}${data.pnl.toFixed(0)}
+                    </div>
+                    <div className="text-[9px] text-zinc-600">WR: {((data.wins / data.total) * 100).toFixed(0)}%</div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        {/* Time of Day Performance */}
+        <div className="crypto-card p-6">
+          <h3 className="text-sm font-bold uppercase text-zinc-500 mb-6 flex items-center gap-2">
+            <Clock className="w-4 h-4" /> Win Rate by Time of Day (Hour)
+          </h3>
+          <div className="h-[250px] w-full">
+            <ResponsiveContainer width="100%" height="100%">
+              <BarChart data={stats.hourlyData}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#27272a" vertical={false} />
+                <XAxis dataKey="hour" stroke="#71717a" fontSize={10} tickLine={false} axisLine={false} />
+                <YAxis stroke="#71717a" fontSize={10} tickLine={false} axisLine={false} tickFormatter={(val) => `${val}%`} />
+                <RechartsTooltip 
+                  contentStyle={{ backgroundColor: '#18181b', border: '1px solid #27272a', borderRadius: '8px' }}
+                  cursor={{ fill: '#27272a' }}
+                  formatter={(val: number) => [`${val.toFixed(1)}%`, 'Win Rate']}
+                />
+                <Bar dataKey="winRate">
+                  {stats.hourlyData.map((entry, index) => (
+                    <Cell key={`cell-${index}`} fill={entry.winRate >= 50 ? '#10b981' : '#f43f5e'} />
+                  ))}
+                </Bar>
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+        </div>
+
+        {/* Monte Carlo Simulation */}
+        <div className="crypto-card p-6">
+          <h3 className="text-sm font-bold uppercase text-zinc-500 mb-6 flex items-center gap-2">
+            <Zap className="w-4 h-4" /> Monte Carlo Equity Projection
+          </h3>
+          <div className="h-[250px] w-full">
+            <ResponsiveContainer width="100%" height="100%">
+              <LineChart>
+                <CartesianGrid strokeDasharray="3 3" stroke="#27272a" vertical={false} />
+                <XAxis dataKey="name" stroke="#71717a" fontSize={10} tickLine={false} axisLine={false} allowDuplicatedCategory={false} />
+                <YAxis stroke="#71717a" fontSize={10} tickLine={false} axisLine={false} tickFormatter={(val) => `$${val}`} domain={['auto', 'auto']} />
+                <RechartsTooltip 
+                  contentStyle={{ backgroundColor: '#18181b', border: '1px solid #27272a', borderRadius: '8px' }}
+                  formatter={(val: number) => [`$${val.toFixed(2)}`, 'Projected Balance']}
+                />
+                {stats.monteCarloPaths.map((path, i) => (
+                  <Line 
+                    key={i} 
+                    type="monotone" 
+                    data={path} 
+                    dataKey="balance" 
+                    stroke={i === 0 ? "#10b981" : "#10b98122"} 
+                    strokeWidth={i === 0 ? 2 : 1} 
+                    dot={false} 
+                    activeDot={i === 0}
+                  />
+                ))}
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+          <p className="text-[10px] text-zinc-500 mt-4 italic">
+            * 20 simulated paths projecting 30 trades into the future based on your historical performance.
+          </p>
         </div>
       </div>
     </div>
