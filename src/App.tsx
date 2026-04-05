@@ -115,31 +115,7 @@ const cleanObject = (obj: any) => {
 // Trade Calculation Utilities
 // Real Binance matching update – April 2026
 
-/**
- * Dynamic Slippage Model
- * Adapts to volatility (ATR), liquidity (book depth), and order type.
- */
-const calculateDynamicSlippage = (params: {
-  baseSlippageBps: number;
-  atr: number;
-  entryPrice: number;
-  notionalValue: number;
-  avgOrderBookDepth: number;
-  orderType: 'MAKER' | 'TAKER';
-}) => {
-  const { baseSlippageBps, atr, entryPrice, notionalValue, avgOrderBookDepth, orderType } = params;
-  
-  const baseSlippage = baseSlippageBps / 10000;
-  const volatilityFactor = (atr > 0 && entryPrice > 0) ? (atr / entryPrice) : 0;
-  const liquidityFactor = avgOrderBookDepth > 0 ? (notionalValue / avgOrderBookDepth) : 0;
-  
-  // Market orders (TAKER) incur significantly higher slippage than LIMIT (MAKER)
-  const orderTypeMultiplier = orderType === 'TAKER' ? 2.0 : 0.5;
 
-  // Final non-linear slippage calculation
-  const slippage = baseSlippage * (1 + volatilityFactor * 5 + liquidityFactor * 2) * orderTypeMultiplier;
-  return slippage;
-};
 
 /**
  * Dynamic Funding Fee Projection
@@ -202,7 +178,8 @@ const calculateRealWorldFriction = (params: {
   quantity: number;
   direction: TradeDirection;
   entryOrderType: 'MAKER' | 'TAKER';
-  exitOrderType: 'MAKER' | 'TAKER';
+  exitTpOrderType: 'MAKER' | 'TAKER';
+  exitSlOrderType: 'MAKER' | 'TAKER';
   estimatedHoldHours: number;
   fundingRatePerInterval: number;
   avgFundingRate: number;
@@ -219,7 +196,8 @@ const calculateRealWorldFriction = (params: {
     quantity,
     direction,
     entryOrderType,
-    exitOrderType,
+    exitTpOrderType,
+    exitSlOrderType,
     estimatedHoldHours,
     fundingRatePerInterval,
     avgFundingRate,
@@ -233,36 +211,8 @@ const calculateRealWorldFriction = (params: {
 
   const discountMultiplier = useDiscount ? 0.9 : 1.0;
   const entryFeeRate = (entryOrderType === 'MAKER' ? makerFee : takerFee) * discountMultiplier / 100;
-  const exitFeeRate = (exitOrderType === 'MAKER' ? makerFee : takerFee) * discountMultiplier / 100;
-
-  const notionalValue = quantity * entryPrice;
-
-  // Use dynamic slippage model
-  const entrySlippage = calculateDynamicSlippage({
-    baseSlippageBps: 5, // Default 5 bps
-    atr,
-    entryPrice,
-    notionalValue,
-    avgOrderBookDepth,
-    orderType: entryOrderType
-  });
-
-  const exitSlippage = calculateDynamicSlippage({
-    baseSlippageBps: 8, // Default 8 bps
-    atr,
-    entryPrice: stopLoss,
-    notionalValue: quantity * stopLoss,
-    avgOrderBookDepth,
-    orderType: exitOrderType
-  });
-
-  const effectiveEntryPrice = direction === 'LONG'
-    ? entryPrice * (1 + entrySlippage)
-    : entryPrice * (1 - entrySlippage);
-
-  const effectiveExitPrice = direction === 'LONG'
-    ? stopLoss * (1 - exitSlippage)
-    : stopLoss * (1 + exitSlippage);
+  const exitTpFeeRate = (exitTpOrderType === 'MAKER' ? makerFee : takerFee) * discountMultiplier / 100;
+  const exitSlFeeRate = (exitSlOrderType === 'MAKER' ? makerFee : takerFee) * discountMultiplier / 100;
 
   // Use dynamic funding simulation
   const fundingRateTotal = simulateFundingFee({
@@ -274,18 +224,17 @@ const calculateRealWorldFriction = (params: {
 
   const totalFundingPnL = quantity * entryPrice * fundingRateTotal;
 
-  const totalFrictionRate = entryFeeRate + exitFeeRate + entrySlippage + exitSlippage + Math.abs(fundingRateTotal);
+    const totalFrictionRate = entryFeeRate + exitSlFeeRate + Math.abs(fundingRateTotal);
 
   return {
-    effectiveEntryPrice,
-    effectiveExitPrice,
+    effectiveEntryPrice: entryPrice,
+    effectiveExitPrice: stopLoss,
     entryFeeRate,
-    exitFeeRate,
+    exitTpFeeRate,
+    exitSlFeeRate,
     totalFundingPnL,
     totalFrictionRate,
-    fundingRateTotal,
-    entrySlippage,
-    exitSlippage
+    fundingRateTotal
   };
 };
 
@@ -325,7 +274,8 @@ const calculateTradeMetrics = (trade: Partial<Trade> & {
   quantity: number, 
   direction: TradeDirection,
   entryOrderType?: 'MAKER' | 'TAKER',
-  exitOrderType?: 'MAKER' | 'TAKER',
+  exitTpOrderType?: 'MAKER' | 'TAKER',
+  exitSlOrderType?: 'MAKER' | 'TAKER',
   estimatedHoldHours?: number,
   fundingRatePerInterval?: number,
   fundingIntervalHours?: number,
@@ -343,7 +293,8 @@ const calculateTradeMetrics = (trade: Partial<Trade> & {
     highestPriceReached, 
     lowestPriceReached,
     entryOrderType = 'TAKER',
-    exitOrderType = 'TAKER',
+    exitTpOrderType = 'TAKER',
+    exitSlOrderType = 'TAKER',
     estimatedHoldHours = 24,
     fundingRatePerInterval = 0.01,
     avgFundingRate = 0.01,
@@ -364,7 +315,8 @@ const calculateTradeMetrics = (trade: Partial<Trade> & {
     quantity,
     direction,
     entryOrderType,
-    exitOrderType,
+    exitTpOrderType,
+    exitSlOrderType,
     estimatedHoldHours,
     fundingRatePerInterval,
     avgFundingRate,
@@ -1135,7 +1087,8 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, t
   const [takerFee, setTakerFee] = useState(0.05); // 0.05% (2026 Standard)
   const [useDiscount, setUseDiscount] = useState(false); // BNB/Referral Discount
   const [entryOrderType, setEntryOrderType] = useState<'MAKER' | 'TAKER'>('TAKER');
-  const [exitOrderType, setExitOrderType] = useState<'MAKER' | 'TAKER'>('TAKER');
+  const [exitTpOrderType, setExitTpOrderType] = useState<'MAKER' | 'TAKER'>('TAKER');
+  const [exitSlOrderType, setExitSlOrderType] = useState<'MAKER' | 'TAKER'>('TAKER');
   const [marginMode, setMarginMode] = useState<'ISOLATED' | 'CROSS'>('ISOLATED');
   const [slippageBuffer, setSlippageBuffer] = useState(0.15); // 0.15% (2026 Standard for Majors)
   const [useConservativeSizing, setUseConservativeSizing] = useState(true);
@@ -1260,7 +1213,8 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, t
       quantity: 1, // Dummy quantity for rate calculation
       direction,
       entryOrderType,
-      exitOrderType,
+      exitTpOrderType,
+      exitSlOrderType,
       estimatedHoldHours: expectedHoldHours,
       fundingRatePerInterval: fundingRate,
       avgFundingRate,
@@ -1274,10 +1228,10 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, t
 
     const totalFrictionRate = friction.totalFrictionRate;
     const entryFeeRate = friction.entryFeeRate;
-    const slFeeRate = friction.exitFeeRate; // SL is exit friction
-    const tpFeeRate = friction.exitFeeRate; // TP is exit friction
+    const slFeeRate = friction.exitSlFeeRate; // SL is exit friction
+    const tpFeeRate = friction.exitTpFeeRate; // TP is exit friction
     
-    const slippageRate = friction.entrySlippage + friction.exitSlippage;
+     const slippageRate = (slippageBuffer * 2) / 100;
     const fundingRateTotal = friction.fundingRateTotal;
     
     // 1. Calculate raw quantities from risk
@@ -1524,7 +1478,7 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, t
       conservativeNotionalValue,
       useConservativeSizing,
       useDiscount,
-      effectiveTakerFee: friction.exitFeeRate * 100,
+      effectiveTakerFee: friction.exitSlFeeRate * 100,
       effectiveMakerFee: friction.entryFeeRate * 100,
       slippageBuffer,
       finalLeverage,
@@ -1533,9 +1487,18 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, t
       fundingPnL: friction.totalFundingPnL,
       adjustedRiskPercent,
       atr,
-      avgOrderBookDepth
+      avgOrderBookDepth,
+      entryOrderType,
+      exitTpOrderType,
+      exitSlOrderType,
+      estimatedHoldHours: expectedHoldHours,
+      fundingRatePerInterval: fundingRate,
+      avgFundingRate,
+      fundingIntervalHours,
+      makerFee,
+      takerFee
     };
-  }, [balance, riskPercent, entryPrice, stopLoss, takeProfit, leverage, direction, symbol, expectedHoldHours, fundingRate, avgFundingRate, makerFee, takerFee, entryOrderType, exitOrderType, marginMode, slippageBuffer, useConservativeSizing, useDiscount, fundingIntervalHours, manualBalance, useJournalBalance, currentBalance, atr, avgOrderBookDepth]);
+   }, [balance, riskPercent, entryPrice, stopLoss, takeProfit, leverage, direction, symbol, expectedHoldHours, fundingRate, avgFundingRate, makerFee, takerFee, entryOrderType, exitTpOrderType, exitSlOrderType, marginMode, useConservativeSizing, useDiscount, fundingIntervalHours, manualBalance, useJournalBalance, currentBalance, atr, avgOrderBookDepth]);
 
   const fetchPrice = async () => {
     if (!symbol) return;
@@ -1787,15 +1750,28 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, t
                     </div>
                   </div>
                   <div className="space-y-1">
-                    <span className="text-[9px] text-zinc-600 uppercase block">Exit Type (SL/TP)</span>
+                      <span className="text-[9px] text-zinc-600 uppercase block">Exit Type (TP)</span>
                     <div className="flex bg-zinc-950 rounded-md border border-zinc-800 p-0.5">
                       <button 
-                        onClick={() => setExitOrderType('MAKER')}
-                        className={cn("flex-1 text-[8px] font-bold py-1 rounded", exitOrderType === 'MAKER' ? "bg-zinc-800 text-emerald-500" : "text-zinc-600")}
+                        onClick={() => setExitTpOrderType('MAKER')}
+                        className={cn("flex-1 text-[8px] font-bold py-1 rounded", exitTpOrderType === 'MAKER' ? "bg-zinc-800 text-emerald-500" : "text-zinc-600")}
                       >MAKER</button>
                       <button 
-                        onClick={() => setExitOrderType('TAKER')}
-                        className={cn("flex-1 text-[8px] font-bold py-1 rounded", exitOrderType === 'TAKER' ? "bg-zinc-800 text-emerald-500" : "text-zinc-600")}
+                         onClick={() => setExitTpOrderType('TAKER')}
+                        className={cn("flex-1 text-[8px] font-bold py-1 rounded", exitTpOrderType === 'TAKER' ? "bg-zinc-800 text-emerald-500" : "text-zinc-600")}
+                      >TAKER</button>
+                    </div>
+                  </div>
+                  <div className="space-y-1">
+                    <span className="text-[9px] text-zinc-600 uppercase block">Exit Type (SL)</span>
+                    <div className="flex bg-zinc-950 rounded-md border border-zinc-800 p-0.5">
+                      <button 
+                        onClick={() => setExitSlOrderType('MAKER')}
+                        className={cn("flex-1 text-[8px] font-bold py-1 rounded", exitSlOrderType === 'MAKER' ? "bg-zinc-800 text-emerald-500" : "text-zinc-600")}
+                      >MAKER</button>
+                      <button 
+                        onClick={() => setExitSlOrderType('TAKER')}
+                        className={cn("flex-1 text-[8px] font-bold py-1 rounded", exitSlOrderType === 'TAKER' ? "bg-zinc-800 text-emerald-500" : "text-zinc-600")}
                       >TAKER</button>
                     </div>
                   </div>
@@ -2105,12 +2081,12 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, t
                       <span className="text-zinc-400 font-mono">${results.entryFee.toFixed(2)}</span>
                     </div>
                     <div className="flex justify-between text-[10px]">
-                      <span className="text-zinc-600">Exit SL ({exitOrderType}):</span>
+                      <span className="text-zinc-600">Exit SL ({exitSlOrderType}):</span>
                       <span className="text-zinc-400 font-mono">${results.exitFeeAtSL.toFixed(2)}</span>
                     </div>
                     {takeProfit && (
                       <div className="flex justify-between text-[10px]">
-                        <span className="text-zinc-600">Exit TP ({exitOrderType}):</span>
+                        <span className="text-zinc-600">Exit TP ({exitTpOrderType}):</span>
                         <span className="text-zinc-400 font-mono">${results.exitFeeAtTP.toFixed(2)}</span>
                       </div>
                     )}

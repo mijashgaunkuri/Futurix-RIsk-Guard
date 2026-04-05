@@ -57,7 +57,8 @@ export interface Trade {
   exitImage5min?: string;
   // Real Binance matching update – April 2026
   entryOrderType?: 'MAKER' | 'TAKER';
-  exitOrderType?: 'MAKER' | 'TAKER';
+  exitTpOrderType?: 'MAKER' | 'TAKER';
+  exitSlOrderType?: 'MAKER' | 'TAKER';
   estimatedHoldHours?: number;
   fundingRatePerInterval?: number;
   fundingIntervalHours?: number;
