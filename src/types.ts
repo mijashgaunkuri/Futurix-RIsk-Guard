@@ -31,11 +31,11 @@ export interface Trade {
   emotion: string;
   postTradeReflection?: string;
   exitRationale?: string;
-  marketCondition: string;
   tags: string[];
   status: 'OPEN' | 'CLOSED';
   marginMode: 'ISOLATED' | 'CROSS';
   addedMargin: number;
+  contractSize?: number;
   plannedRR: number;
   actualRR?: number;
   balanceBefore: number;
@@ -56,6 +56,25 @@ export interface Trade {
   durationMinutes?: number;
   entryImage1h?: string;
   exitImage5min?: string;
+  // Real Binance matching update – April 2026
+  entryOrderType?: 'MAKER' | 'TAKER';
+  exitOrderType?: 'MAKER' | 'TAKER';
+  estimatedHoldHours?: number;
+  fundingRatePerInterval?: number;
+  fundingIntervalHours?: number;
+  entrySlippageBps?: number;
+  exitSlippageBps?: number;
+  effectiveEntryPrice?: number;
+  effectiveExitPrice?: number;
+  fundingPnL?: number;
+  finalLeverageUsed?: number;
+  useDiscount?: boolean;
+  makerFee?: number;
+  takerFee?: number;
+  atr?: number;
+  avgOrderBookDepth?: number;
+  avgFundingRate?: number;
+  adjustedRiskPercent?: number;
 }
 
 export interface BalanceHistory {

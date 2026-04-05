@@ -33,6 +33,7 @@ import {
   Calendar as CalendarIcon,
   ArrowUpRight,
   ArrowDownRight,
+  ArrowDownLeft,
   Wallet,
   History,
   Tag,
@@ -70,7 +71,7 @@ import { format, subMonths, isSameDay, startOfMonth, endOfMonth, eachDayOfInterv
 import { motion, AnimatePresence } from 'motion/react';
 
 import { Trade, TradeDirection, BalanceHistory, MMRTier } from './types';
-import { SYMBOL_MMR_TIERS, COMMON_SYMBOLS, STRATEGIES, TIMEFRAMES, EMOTIONS, MARKET_CONDITIONS, PREDEFINED_TAGS } from './constants';
+import { SYMBOL_MMR_TIERS, COMMON_SYMBOLS, STRATEGIES, TIMEFRAMES, EMOTIONS, PREDEFINED_TAGS } from './constants';
 import { 
   auth, 
   db, 
@@ -92,7 +93,8 @@ import {
   query, 
   orderBy, 
   writeBatch,
-  deleteDoc
+  deleteDoc,
+  getDocFromServer
 } from 'firebase/firestore';
 
 // Helper Functions
@@ -111,24 +113,303 @@ const cleanObject = (obj: any) => {
 };
 
 // Trade Calculation Utilities
-const calculateTradeMetrics = (trade: Partial<Trade> & { entryPrice: number, stopLoss: number, quantity: number, direction: TradeDirection }) => {
-  const { entryPrice, stopLoss, quantity, direction, exitPrice, fees = 0, highestPriceReached, lowestPriceReached } = trade;
+// Real Binance matching update – April 2026
+
+/**
+ * Dynamic Slippage Model
+ * Adapts to volatility (ATR), liquidity (book depth), and order type.
+ */
+const calculateDynamicSlippage = (params: {
+  baseSlippageBps: number;
+  atr: number;
+  entryPrice: number;
+  notionalValue: number;
+  avgOrderBookDepth: number;
+  orderType: 'MAKER' | 'TAKER';
+}) => {
+  const { baseSlippageBps, atr, entryPrice, notionalValue, avgOrderBookDepth, orderType } = params;
+  
+  const baseSlippage = baseSlippageBps / 10000;
+  const volatilityFactor = (atr > 0 && entryPrice > 0) ? (atr / entryPrice) : 0;
+  const liquidityFactor = avgOrderBookDepth > 0 ? (notionalValue / avgOrderBookDepth) : 0;
+  
+  // Market orders (TAKER) incur significantly higher slippage than LIMIT (MAKER)
+  const orderTypeMultiplier = orderType === 'TAKER' ? 2.0 : 0.5;
+
+  // Final non-linear slippage calculation
+  const slippage = baseSlippage * (1 + volatilityFactor * 5 + liquidityFactor * 2) * orderTypeMultiplier;
+  return slippage;
+};
+
+/**
+ * Dynamic Funding Fee Projection
+ * Simulates funding fluctuations over the estimated hold time.
+ */
+const simulateFundingFee = (params: {
+  currentFundingRate: number;
+  avgFundingRate: number;
+  holdHours: number;
+  intervalHours: number;
+  seed?: number;
+}) => {
+  const { currentFundingRate, avgFundingRate, holdHours, intervalHours } = params;
+  const intervals = Math.floor(holdHours / intervalHours);
+  if (intervals <= 0) return 0;
+
+  let totalRate = 0;
+  let currentRate = currentFundingRate / 100;
+  const avgRate = avgFundingRate / 100;
+
+  // Pseudo-random simulation for funding variability
+  for (let i = 0; i < intervals; i++) {
+    // Simulate fluctuation: ±20% of base rate + some drift towards average
+    const fluctuation = (Math.random() * 0.4 - 0.2) * currentRate;
+    const drift = (avgRate - currentRate) * 0.1;
+    currentRate = currentRate + fluctuation + drift;
+    
+    // Occasionally flip sign if near zero to simulate market sentiment shifts
+    if (Math.abs(currentRate) < 0.00005 && Math.random() > 0.9) {
+      currentRate = -currentRate;
+    }
+    
+    totalRate += currentRate;
+  }
+
+  return totalRate;
+};
+
+/**
+ * Volatility-Adjusted Risk
+ * Reduces position size (risk) when market volatility (ATR) is high.
+ */
+const getVolatilityAdjustedRisk = (params: {
+  baseRiskPercent: number;
+  atr: number;
+  entryPrice: number;
+}) => {
+  const { baseRiskPercent, atr, entryPrice } = params;
+  if (atr <= 0 || entryPrice <= 0) return baseRiskPercent;
+  
+  const volatilityMultiplier = atr / entryPrice;
+  // Non-linear risk reduction: higher volatility = exponentially lower risk
+  const adjustedRisk = baseRiskPercent / (1 + volatilityMultiplier * 20); 
+  return adjustedRisk;
+};
+
+const calculateRealWorldFriction = (params: {
+  entryPrice: number;
+  stopLoss: number;
+  quantity: number;
+  direction: TradeDirection;
+  entryOrderType: 'MAKER' | 'TAKER';
+  exitOrderType: 'MAKER' | 'TAKER';
+  estimatedHoldHours: number;
+  fundingRatePerInterval: number;
+  avgFundingRate: number;
+  fundingIntervalHours: number;
+  entrySlippageBps: number;
+  exitSlippageBps: number;
+  atr: number;
+  avgOrderBookDepth: number;
+  useDiscount: boolean;
+  makerFee: number;
+  takerFee: number;
+  contractSize: number;
+}) => {
+  const {
+    entryPrice,
+    stopLoss,
+    quantity,
+    direction,
+    entryOrderType,
+    exitOrderType,
+    estimatedHoldHours,
+    fundingRatePerInterval,
+    avgFundingRate,
+    fundingIntervalHours,
+    entrySlippageBps,
+    exitSlippageBps,
+    atr,
+    avgOrderBookDepth,
+    useDiscount,
+    makerFee,
+    takerFee,
+    contractSize
+  } = params;
+
+  const discountMultiplier = useDiscount ? 0.9 : 1.0;
+  const entryFeeRate = (entryOrderType === 'MAKER' ? makerFee : takerFee) * discountMultiplier / 100;
+  const exitFeeRate = (exitOrderType === 'MAKER' ? makerFee : takerFee) * discountMultiplier / 100;
+
+  const notionalValue = quantity * contractSize * entryPrice;
+
+  // Use dynamic slippage model
+  const entrySlippage = calculateDynamicSlippage({
+    baseSlippageBps: entrySlippageBps,
+    atr,
+    entryPrice,
+    notionalValue,
+    avgOrderBookDepth,
+    orderType: entryOrderType
+  });
+
+  const exitSlippage = calculateDynamicSlippage({
+    baseSlippageBps: exitSlippageBps,
+    atr,
+    entryPrice: stopLoss,
+    notionalValue: quantity * contractSize * stopLoss,
+    avgOrderBookDepth,
+    orderType: exitOrderType
+  });
+
+  const effectiveEntryPrice = direction === 'LONG'
+    ? entryPrice * (1 + entrySlippage)
+    : entryPrice * (1 - entrySlippage);
+
+  const effectiveExitPrice = direction === 'LONG'
+    ? stopLoss * (1 - exitSlippage)
+    : stopLoss * (1 + exitSlippage);
+
+  // Use dynamic funding simulation
+  const fundingRateTotal = simulateFundingFee({
+    currentFundingRate: fundingRatePerInterval,
+    avgFundingRate,
+    holdHours: estimatedHoldHours,
+    intervalHours: fundingIntervalHours
+  });
+
+  const totalFundingPnL = quantity * contractSize * entryPrice * fundingRateTotal;
+
+  const totalFrictionRate = entryFeeRate + exitFeeRate + entrySlippage + exitSlippage + Math.abs(fundingRateTotal);
+
+  return {
+    effectiveEntryPrice,
+    effectiveExitPrice,
+    entryFeeRate,
+    exitFeeRate,
+    totalFundingPnL,
+    totalFrictionRate,
+    fundingRateTotal,
+    entrySlippage,
+    exitSlippage
+  };
+};
+
+const getMaxLeverageForNotional = (symbol: string, notionalUSDT: number): number => {
+  // Binance real tier table logic (simplified for common pairs)
+  if (symbol === 'BTCUSDT') {
+    if (notionalUSDT <= 50000) return 125;
+    if (notionalUSDT <= 250000) return 100;
+    if (notionalUSDT <= 1000000) return 50;
+    if (notionalUSDT <= 5000000) return 20;
+    if (notionalUSDT <= 10000000) return 10;
+    return 5;
+  } else if (symbol === 'ETHUSDT') {
+    if (notionalUSDT <= 10000) return 100;
+    if (notionalUSDT <= 50000) return 50;
+    if (notionalUSDT <= 250000) return 20;
+    if (notionalUSDT <= 1000000) return 10;
+    return 5;
+  }
+  // Default for other symbols
+  if (notionalUSDT <= 5000) return 50;
+  if (notionalUSDT <= 25000) return 20;
+  if (notionalUSDT <= 100000) return 10;
+  return 5;
+};
+
+const getSymbolNotionalLimit = (symbol: string): number => {
+  // Return Binance position notional limit for the symbol
+  if (symbol === 'BTCUSDT') return 50000000;
+  if (symbol === 'ETHUSDT') return 20000000;
+  return 5000000; // Default 5M USDT
+};
+
+const calculateTradeMetrics = (trade: Partial<Trade> & { 
+  entryPrice: number, 
+  stopLoss: number, 
+  quantity: number, 
+  direction: TradeDirection,
+  entryOrderType?: 'MAKER' | 'TAKER',
+  exitOrderType?: 'MAKER' | 'TAKER',
+  estimatedHoldHours?: number,
+  fundingRatePerInterval?: number,
+  fundingIntervalHours?: number,
+  entrySlippageBps?: number,
+  exitSlippageBps?: number,
+  useDiscount?: boolean,
+  makerFee?: number,
+  takerFee?: number,
+  contractSize?: number
+}) => {
+  const { 
+    entryPrice, 
+    stopLoss, 
+    quantity, 
+    direction, 
+    exitPrice, 
+    fees = 0, 
+    highestPriceReached, 
+    lowestPriceReached,
+    entryOrderType = 'TAKER',
+    exitOrderType = 'TAKER',
+    estimatedHoldHours = 24,
+    fundingRatePerInterval = 0.01,
+    avgFundingRate = 0.01,
+    fundingIntervalHours = 8,
+    entrySlippageBps = 5,
+    exitSlippageBps = 8,
+    atr = 0,
+    avgOrderBookDepth = 1000000,
+    useDiscount = false,
+    makerFee = 0.02,
+    takerFee = 0.05,
+    contractSize = 1
+  } = trade;
   
   if (exitPrice === undefined) return null;
 
+  // Real Binance matching update – April 2026
+  const friction = calculateRealWorldFriction({
+    entryPrice,
+    stopLoss: exitPrice, // Use exitPrice for friction calculation on exit
+    quantity,
+    direction,
+    entryOrderType,
+    exitOrderType,
+    estimatedHoldHours,
+    fundingRatePerInterval,
+    avgFundingRate,
+    fundingIntervalHours,
+    entrySlippageBps,
+    exitSlippageBps,
+    atr,
+    avgOrderBookDepth,
+    useDiscount,
+    makerFee,
+    takerFee,
+    contractSize
+  });
+
+  const effectiveEntryPrice = friction.effectiveEntryPrice;
+  const effectiveExitPrice = friction.effectiveExitPrice;
+  const fundingPnL = friction.totalFundingPnL;
+
   const riskPerUnit = Math.abs(entryPrice - stopLoss);
-  const pnl = direction === 'LONG' 
-    ? (exitPrice - entryPrice) * quantity 
-    : (entryPrice - exitPrice) * quantity;
   
-  const netPnl = pnl - fees;
-  const actualRR = pnl / (riskPerUnit * quantity);
+  // Gross PnL using effective prices
+  const pnl = direction === 'LONG' 
+    ? (effectiveExitPrice - effectiveEntryPrice) * quantity * (contractSize || 1)
+    : (effectiveEntryPrice - effectiveExitPrice) * quantity * (contractSize || 1);
+  
+  const netPnl = pnl - fees + fundingPnL;
+  const actualRR = pnl / (riskPerUnit * quantity * (contractSize || 1));
 
   // Exit Efficiency: How much of the maximum favorable move was captured
   let mfePrice = direction === 'LONG' ? (highestPriceReached || exitPrice) : (lowestPriceReached || exitPrice);
   const maxPossiblePnl = direction === 'LONG'
-    ? (mfePrice - entryPrice) * quantity
-    : (entryPrice - mfePrice) * quantity;
+    ? (mfePrice - effectiveEntryPrice) * quantity * (contractSize || 1)
+    : (effectiveEntryPrice - mfePrice) * quantity * (contractSize || 1);
 
   const exitEfficiency = maxPossiblePnl > 0 && pnl > 0 
     ? (pnl / maxPossiblePnl) * 100 
@@ -138,7 +419,10 @@ const calculateTradeMetrics = (trade: Partial<Trade> & { entryPrice: number, sto
     pnl,
     netPnl,
     actualRR,
-    exitEfficiency: Math.max(0, Math.min(100, exitEfficiency))
+    exitEfficiency: Math.max(0, Math.min(100, exitEfficiency)),
+    fundingPnL,
+    effectiveEntryPrice,
+    effectiveExitPrice
   };
 };
 
@@ -151,6 +435,21 @@ export default function App() {
   const [nprRate, setNprRate] = useState<number>(134); // Fallback rate
   const [user, setUser] = useState<FirebaseUser | null>(null);
   const [isAuthReady, setIsAuthReady] = useState(false);
+
+  // Test Firestore connection
+  useEffect(() => {
+    async function testConnection() {
+      try {
+        await getDocFromServer(doc(db, 'test', 'connection'));
+        console.log("Firestore connection successful");
+      } catch (error) {
+        if (error instanceof Error && error.message.includes('the client is offline')) {
+          console.error("Please check your Firebase configuration. The client is offline.");
+        }
+      }
+    }
+    testConnection();
+  }, []);
 
   // Auth Listener
   useEffect(() => {
@@ -494,7 +793,6 @@ export default function App() {
           actualRR: 0,
           exitEfficiency: 0,
           emotion: 'Neutral',
-          marketCondition: 'Ranging',
           balanceBefore: currentBalance
         };
 
@@ -839,13 +1137,23 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, t
       return saved ? JSON.parse(saved).leverage ?? 10 : 10;
     } catch (e) { return 10; }
   });
-  const [expectedHoldHours, setExpectedHoldHours] = useState(8);
+  const [expectedHoldHours, setExpectedHoldHours] = useState(24); // Real Binance matching update – April 2026
   const [fundingRate, setFundingRate] = useState(0.01); // Default 0.01%
-  const [makerFee, setMakerFee] = useState(0.02); // 0.02%
-  const [takerFee, setTakerFee] = useState(0.05); // 0.05%
-  const [entryFeeType, setEntryFeeType] = useState<'MAKER' | 'TAKER'>('TAKER');
-  const [exitFeeType, setExitFeeType] = useState<'MAKER' | 'TAKER'>('TAKER');
+  const [avgFundingRate, setAvgFundingRate] = useState(0.01); // Fallback avg funding
+  const [fundingIntervalHours, setFundingIntervalHours] = useState(8);
+  const [atr, setAtr] = useState(0); // Average True Range
+  const [avgOrderBookDepth, setAvgOrderBookDepth] = useState(1000000); // Default $1M depth for majors
+  const [entrySlippageBps, setEntrySlippageBps] = useState(5);
+  const [exitSlippageBps, setExitSlippageBps] = useState(8);
+  const [makerFee, setMakerFee] = useState(0.02); // 0.02% (2026 Standard)
+  const [takerFee, setTakerFee] = useState(0.05); // 0.05% (2026 Standard)
+  const [useDiscount, setUseDiscount] = useState(false); // BNB/Referral Discount
+  const [entryOrderType, setEntryOrderType] = useState<'MAKER' | 'TAKER'>('TAKER');
+  const [exitOrderType, setExitOrderType] = useState<'MAKER' | 'TAKER'>('TAKER');
   const [marginMode, setMarginMode] = useState<'ISOLATED' | 'CROSS'>('ISOLATED');
+  const [slippageBuffer, setSlippageBuffer] = useState(0.15); // 0.15% (2026 Standard for Majors)
+  const [contractSize, setContractSize] = useState(1); // 1 unit per contract
+  const [useConservativeSizing, setUseConservativeSizing] = useState(true);
   const [isFetching, setIsFetching] = useState(false);
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [isScanning, setIsScanning] = useState(false);
@@ -929,24 +1237,100 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, t
       entryPrice,
       stopLoss,
       takeProfit,
-      leverage
+      leverage,
+      atr,
+      avgOrderBookDepth,
+      avgFundingRate
     };
     localStorage.setItem('calculator_trade_params', JSON.stringify(dataToSave));
-  }, [direction, symbol, riskPercent, entryPrice, stopLoss, takeProfit, leverage]);
+  }, [direction, symbol, riskPercent, entryPrice, stopLoss, takeProfit, leverage, atr, avgOrderBookDepth, avgFundingRate]);
 
   const balance = useJournalBalance ? currentBalance : manualBalance;
 
   const results = useMemo(() => {
     if (!entryPrice || !stopLoss || entryPrice === stopLoss) return null;
 
-    const riskAmount = balance * (riskPercent / 100);
+    const balance = useJournalBalance ? currentBalance : manualBalance;
+    
+    // Volatility-Adjusted Risk
+    const adjustedRiskPercent = getVolatilityAdjustedRisk({
+      baseRiskPercent: riskPercent,
+      atr,
+      entryPrice
+    });
+    const riskAmount = balance * (adjustedRiskPercent / 100);
+    
     const priceDiff = direction === 'LONG' ? (entryPrice - stopLoss) : (stopLoss - entryPrice);
     
     // Ensure priceDiff is positive for valid trades (SL must be below entry for LONG, above for SHORT)
     if (priceDiff <= 0) return null;
 
-    const quantity = riskAmount / priceDiff;
-    const notionalValue = quantity * entryPrice;
+    // Real Binance matching update – April 2026
+    const friction = calculateRealWorldFriction({
+      entryPrice,
+      stopLoss,
+      quantity: 1, // Dummy quantity for rate calculation
+      direction,
+      entryOrderType,
+      exitOrderType,
+      estimatedHoldHours: expectedHoldHours,
+      fundingRatePerInterval: fundingRate,
+      avgFundingRate,
+      fundingIntervalHours,
+      entrySlippageBps,
+      exitSlippageBps,
+      atr,
+      avgOrderBookDepth,
+      useDiscount,
+      makerFee,
+      takerFee,
+      contractSize
+    });
+
+    const totalFrictionRate = friction.totalFrictionRate;
+    const entryFeeRate = friction.entryFeeRate;
+    const slFeeRate = friction.exitFeeRate; // SL is exit friction
+    const tpFeeRate = friction.exitFeeRate; // TP is exit friction
+    
+    const slippageRate = friction.entrySlippage + friction.exitSlippage;
+    const fundingRateTotal = friction.fundingRateTotal;
+    
+    // 1. Calculate raw quantities from risk
+    const priceDiffPerContract = priceDiff * contractSize;
+    const effectiveRiskPerContract = (priceDiff + (entryPrice * totalFrictionRate)) * contractSize;
+    
+    let rawConservativeQuantity = riskAmount / effectiveRiskPerContract;
+    let rawStandardQuantity = riskAmount / priceDiffPerContract;
+
+    // 2. Apply REAL Binance constraints
+    const maxNotionalLimit = getSymbolNotionalLimit(symbol);
+    const maxQuantityByNotional = maxNotionalLimit / (entryPrice * contractSize);
+
+    // Conservative constraints
+    const maxLeverageCons = getMaxLeverageForNotional(symbol, rawConservativeQuantity * contractSize * entryPrice);
+    const finalLeverageCons = Math.min(leverage, maxLeverageCons);
+    const maxQtyBalanceCons = (balance * finalLeverageCons) / (entryPrice * contractSize);
+    const finalConsQuantity = Math.min(rawConservativeQuantity, maxQtyBalanceCons, maxQuantityByNotional);
+
+    // Standard constraints
+    const maxLeverageStd = getMaxLeverageForNotional(symbol, rawStandardQuantity * contractSize * entryPrice);
+    const finalLeverageStd = Math.min(leverage, maxLeverageStd);
+    const maxQtyBalanceStd = (balance * finalLeverageStd) / (entryPrice * contractSize);
+    const finalStdQuantity = Math.min(rawStandardQuantity, maxQtyBalanceStd, maxQuantityByNotional);
+
+    // 7. Round down to contract step size (Binance minimum quantity precision)
+    const stepSize = contractSize > 1 ? 1 : 0.001;
+    const conservativeQuantity = Math.floor(finalConsQuantity / stepSize) * stepSize;
+    const standardQuantity = Math.floor(finalStdQuantity / stepSize) * stepSize;
+
+    // CHOSEN QUANTITY BASED ON USER CHOICE
+    const quantity = useConservativeSizing ? conservativeQuantity : standardQuantity;
+    const finalLeverage = useConservativeSizing ? finalLeverageCons : finalLeverageStd;
+    const maxLeverageForThisNotional = useConservativeSizing ? maxLeverageCons : maxLeverageStd;
+    const notionalValue = quantity * contractSize * entryPrice;
+    
+    const standardNotionalValue = standardQuantity * contractSize * entryPrice;
+    const conservativeNotionalValue = conservativeQuantity * contractSize * entryPrice;
 
     // MMR Tier calculation
     const tiers = SYMBOL_MMR_TIERS[symbol] || SYMBOL_MMR_TIERS['DEFAULT'];
@@ -955,66 +1339,67 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, t
     const maintenanceAmount = tier.maintenanceAmount;
 
     // Initial Margin
-    const initialMargin = notionalValue / leverage;
+    const initialMargin = notionalValue / finalLeverage;
 
     // Fee Calculation
-    const entryFeeRate = (entryFeeType === 'MAKER' ? makerFee : takerFee) / 100;
-    const exitFeeRate = (exitFeeType === 'MAKER' ? makerFee : takerFee) / 100;
-    
     const entryFee = notionalValue * entryFeeRate;
-    const exitFee = notionalValue * exitFeeRate; // Approximate exit fee based on entry notional
+    const exitFeeAtSL = (quantity * contractSize * stopLoss) * slFeeRate;
+    const exitFeeAtTP = takeProfit ? (quantity * contractSize * takeProfit) * tpFeeRate : exitFeeAtSL;
     
-    // Taker fee for liquidation (exchanges often add this to MM requirement)
+    // Taker fee for liquidation (exchanges charge this to close the position)
     const liqFeeRate = takerFee / 100;
-    const liqFee = notionalValue * liqFeeRate;
-
-    const maintenanceMargin = (notionalValue * mmr) - maintenanceAmount + liqFee;
+    
+    // Maintenance Margin Requirement (MMR)
+    const maintenanceMargin = (notionalValue * (mmr + liqFeeRate)) - maintenanceAmount;
     
     const feeCost = entryFee; // Cost to open
-    const feeBuffer = feeCost * 0.1; // 10% buffer on entry fees
     
     // Funding Fee Calculation
-    // Funding is typically every 8 hours. 
-    // Estimated Funding = Notional Value * Funding Rate * (Hold Time / 8)
-    const fundingFee = notionalValue * (fundingRate / 100) * (expectedHoldHours / 8);
+    const fundingFee = notionalValue * fundingRateTotal;
     
-    const totalRequired = initialMargin + feeCost + feeBuffer + (fundingRate > 0 ? fundingFee : 0);
+    const totalRequired = initialMargin + entryFee + (riskAmount * 0.25) + fundingFee;
     const canTakeTrade = totalRequired < balance;
 
-    // Bankruptcy Price (price where loss = Initial Margin)
+    // Bankruptcy Price
     const bankruptcyPrice = direction === 'LONG' 
-      ? entryPrice - (initialMargin / quantity)
-      : entryPrice + (initialMargin / quantity);
+      ? entryPrice - (initialMargin / (quantity * contractSize))
+      : entryPrice + (initialMargin / (quantity * contractSize));
 
-    // Exact Isolated/Cross Margin Liquidation Price formulas
-    // For Long: Liq Price = (Entry Price * Quantity - MarginInPosition - Maintenance Amount + LiqFee) / (Quantity * (1 - MMR))
-    // For Short: Liq Price = (Entry Price * Quantity + MarginInPosition + Maintenance Amount - LiqFee) / (Quantity * (1 + MMR))
-    
-    // In Cross mode, MarginInPosition = Wallet Balance
-    // In Isolated mode, MarginInPosition = Initial Margin
     const marginInPosition = marginMode === 'CROSS' ? balance : initialMargin;
+    const totalUnits = quantity * contractSize;
 
     const liquidationPrice = direction === 'LONG'
-      ? (entryPrice * quantity - marginInPosition - maintenanceAmount + liqFee) / (quantity * (1 - mmr))
-      : (entryPrice * quantity + marginInPosition + maintenanceAmount - liqFee) / (quantity * (1 + mmr));
+      ? (entryPrice * totalUnits - marginInPosition - maintenanceAmount) / (totalUnits * (1 - mmr - liqFeeRate))
+      : (entryPrice * totalUnits + marginInPosition + maintenanceAmount) / (totalUnits * (1 + mmr + liqFeeRate));
 
+    // Simple Liquidation
     const simpleLiq = direction === 'LONG'
-      ? entryPrice * (1 - 1 / leverage)
-      : entryPrice * (1 + 1 / leverage);
+      ? entryPrice * (1 - 1 / finalLeverage - 0.005)
+      : entryPrice * (1 + 1 / finalLeverage + 0.005);
 
     const distToSL = (Math.abs(entryPrice - stopLoss) / entryPrice) * 100;
+    const effectiveSLDist = distToSL + (totalFrictionRate * 100);
     const distToLiq = (Math.abs(entryPrice - liquidationPrice) / entryPrice) * 100;
     const safetyBuffer = distToLiq / distToSL;
 
-    const pnlAtSL = direction === 'LONG' ? (stopLoss - entryPrice) * quantity : (entryPrice - stopLoss) * quantity;
-    const pnlAtTP = takeProfit ? (direction === 'LONG' ? (takeProfit - entryPrice) * quantity : (entryPrice - takeProfit) * quantity) : 0;
+    const pnlAtSL = (direction === 'LONG' ? (stopLoss - entryPrice) : (entryPrice - stopLoss)) * quantity * contractSize;
+    const pnlAtTP = takeProfit ? (direction === 'LONG' ? (takeProfit - entryPrice) : (entryPrice - takeProfit)) * quantity * contractSize : 0;
     
-    // Round trip fees (entry + exit) + funding
-    const estimatedTotalFees = entryFee + exitFee + fundingFee;
-    const netPnlAtSL = pnlAtSL - estimatedTotalFees;
-    const netPnlAtTP = pnlAtTP - estimatedTotalFees;
+    // 1. Net PnL at Stop Loss (Exactly -riskAmount when conservative sizing is used)
+    const priceLoss = Math.abs(pnlAtSL);
+    const frictionCost = notionalValue * totalFrictionRate;
+    const netPnlAtSL = - (priceLoss + frictionCost);
+    
+    // 2. Net PnL at Take Profit (Realistic estimate)
+    const priceProfit = Math.abs(pnlAtTP);
+    const tpFrictionRate = entryFeeRate + tpFeeRate + (slippageRate * 0.5); // 50% slippage at TP for conservative estimate
+    const totalTpFriction = takeProfit ? (notionalValue * (tpFrictionRate + fundingRateTotal)) : 0;
+    const netPnlAtTP = takeProfit ? (priceProfit - totalTpFriction) : 0;
+    
+    const estimatedTotalFees = frictionCost; // For summary display
 
     const plannedRR = takeProfit ? Math.abs(takeProfit - entryPrice) / Math.abs(entryPrice - stopLoss) : 0;
+    const netRR = takeProfit ? Math.abs(netPnlAtTP) / riskAmount : 0;
 
     const suggestedTP2 = direction === 'LONG' ? entryPrice + (priceDiff * 2) : entryPrice - (priceDiff * 2);
     const suggestedTP3 = direction === 'LONG' ? entryPrice + (priceDiff * 3) : entryPrice - (priceDiff * 3);
@@ -1036,59 +1421,75 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, t
       },
       {
         id: 2,
-        name: "Profit Potential",
-        passed: plannedRR >= 2,
-        value: `${plannedRR.toFixed(2)}:1`,
-        advice: plannedRR < 2 ? "Aim for at least 2:1 RR for long-term edge." : "Excellent risk-to-reward ratio."
+        name: "Leverage Safety",
+        passed: finalLeverage <= maxSafeLeverage,
+        value: `${finalLeverage}x`,
+        advice: finalLeverage > maxSafeLeverage ? `Leverage too high for this SL. Max safe: ${maxSafeLeverage}x.` : "Leverage is safe for this stop loss distance."
       },
       {
         id: 3,
         name: "Liquidation Safety",
         passed: safetyBuffer >= 3,
-        value: `${safetyBuffer.toFixed(1)}x`,
-        advice: safetyBuffer < 3 ? "Liq. price is too close to SL. Reduce leverage." : "Strong safety buffer against liquidation."
+        value: `${safetyBuffer.toFixed(2)}x`,
+        advice: safetyBuffer < 3 ? (safetyBuffer < 2.5 ? "CRITICAL: Buffer < 2.5x. Reduce leverage or reduce size." : "Caution: Liquidation is relatively close to SL.") : "Liquidation price is safely far from stop loss."
       },
       {
         id: 4,
-        name: "Leverage Efficiency",
-        passed: leverage <= maxSafeLeverage,
-        value: `${leverage}x`,
-        advice: leverage > maxSafeLeverage ? `Leverage exceeds safe limit (${maxSafeLeverage}x).` : "Leverage is optimized for this SL distance."
+        name: "Reward-to-Risk",
+        passed: plannedRR >= 2,
+        value: `${plannedRR.toFixed(2)}:1`,
+        advice: plannedRR < 2 ? "RR ratio is below 2:1. Strategy may lack edge." : "Good reward-to-risk ratio."
       },
       {
         id: 5,
-        name: "Stop Loss Distance",
-        passed: distToSL >= 0.5,
-        value: `${distToSL.toFixed(2)}%`,
-        advice: distToSL < 0.5 ? "SL is very tight. High noise sensitivity." : "SL distance allows for normal market noise."
+        name: "Capital Efficiency",
+        passed: initialMargin < balance * 0.5,
+        value: `${((initialMargin / balance) * 100).toFixed(1)}%`,
+        advice: initialMargin > balance * 0.5 ? "Using > 50% of account as margin. High risk." : "Margin usage is within safe limits."
       },
       {
         id: 6,
-        name: "Position Sizing",
-        passed: initialMargin <= balance * 0.2,
-        value: `$${initialMargin.toFixed(2)}`,
-        advice: initialMargin > balance * 0.2 ? "Margin exceeds 20% of balance. Over-exposure." : "Margin usage is conservative."
+        name: "Funding Impact",
+        passed: Math.abs(fundingFee) < riskAmount * 0.1,
+        value: `$${fundingFee.toFixed(2)}`,
+        advice: Math.abs(fundingFee) > riskAmount * 0.1 ? "Funding costs are significant. Consider shorter hold." : "Funding impact is negligible."
       },
       {
         id: 7,
-        name: "Exit Strategy",
-        passed: takeProfit > 0,
-        value: takeProfit > 0 ? "SET" : "NONE",
-        advice: takeProfit === 0 ? "No Take Profit set. Trading without a target." : "Clear exit target established."
+        name: "Slippage Impact",
+        passed: (slippageRate * notionalValue) < riskAmount * 0.2,
+        value: `${(slippageRate * 100).toFixed(2)}%`,
+        advice: (slippageRate * notionalValue) > riskAmount * 0.2 ? "High slippage risk. Use limit orders if possible." : "Slippage impact is manageable."
       },
       {
         id: 8,
-        name: "Bankruptcy Risk",
-        passed: Math.abs(entryPrice - bankruptcyPrice) > Math.abs(entryPrice - stopLoss) * 1.5,
-        value: "PROTECTED",
-        advice: Math.abs(entryPrice - bankruptcyPrice) <= Math.abs(entryPrice - stopLoss) * 1.5 ? "Bankruptcy price is dangerously close to SL." : "Bankruptcy risk is well beyond SL."
+        name: "Margin Mode",
+        passed: marginMode === 'ISOLATED',
+        value: marginMode,
+        advice: marginMode === 'CROSS' ? "Cross margin can risk entire balance. Use Isolated for safety." : "Isolated margin limits risk to position only."
       },
       {
         id: 9,
-        name: "Entry Precision",
-        passed: Math.abs(entryPrice - stopLoss) / entryPrice > 0.001,
-        value: "VALID",
-        advice: Math.abs(entryPrice - stopLoss) / entryPrice <= 0.001 ? "Entry/SL gap is too small for exchange precision." : "Entry precision is within valid ranges."
+        name: "Symbol Volatility",
+        passed: ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'].includes(symbol),
+        value: symbol,
+        advice: !['BTCUSDT', 'ETHUSDT', 'SOLUSDT'].includes(symbol) ? "Altcoins have higher volatility and slippage." : "Trading a major, high-liquidity symbol."
+      },
+      {
+        id: 10,
+        name: "Capital Buffer",
+        passed: canTakeTrade,
+        value: canTakeTrade ? "ADEQUATE" : "INSUFFICIENT",
+        advice: !canTakeTrade ? "Total required exceeds balance. Reduce size or leverage." : "Adequate capital to cover margin and friction."
+      },
+      {
+        id: 11,
+        name: "SL Validation (ATR)",
+        passed: atr > 0 ? (distToSL / 100 * entryPrice) >= 1.5 * atr : true,
+        value: atr > 0 ? `${(distToSL / 100 * entryPrice / atr).toFixed(1)} ATR` : "N/A",
+        advice: atr > 0 && (distToSL / 100 * entryPrice) < 1.5 * atr 
+          ? "Stop loss is too tight relative to volatility. Increase SL distance." 
+          : "Stop loss distance is adequate for current volatility."
       }
     ];
 
@@ -1097,6 +1498,8 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, t
     return {
       riskAmount,
       quantity,
+      effectiveSLDist,
+      totalFrictionRate,
       notionalValue,
       initialMargin,
       maintenanceMargin,
@@ -1109,6 +1512,7 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, t
       pnlAtSL,
       pnlAtTP,
       plannedRR,
+      netRR,
       suggestedTP2,
       suggestedTP3,
       mmr: mmr * 100,
@@ -1118,16 +1522,35 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, t
       qualityScore,
       feeCost,
       entryFee,
-      exitFee,
+      exitFee: exitFeeAtSL,
+      exitFeeAtSL,
+      exitFeeAtTP,
       fundingFee,
       estimatedTotalFees,
       netPnlAtSL,
       netPnlAtTP,
+      totalTpFriction,
       totalRequired,
       canTakeTrade,
-      marginMode
+      marginMode,
+      standardQuantity,
+      conservativeQuantity,
+      standardNotionalValue,
+      conservativeNotionalValue,
+      useConservativeSizing,
+      useDiscount,
+      effectiveTakerFee: friction.exitFeeRate * 100,
+      effectiveMakerFee: friction.entryFeeRate * 100,
+      slippageBuffer,
+      finalLeverage,
+      maxLeverageForThisNotional,
+      maxNotionalLimit,
+      fundingPnL: friction.totalFundingPnL,
+      adjustedRiskPercent,
+      atr,
+      avgOrderBookDepth
     };
-  }, [balance, riskPercent, entryPrice, stopLoss, takeProfit, leverage, direction, symbol, expectedHoldHours, fundingRate, makerFee, takerFee, entryFeeType, exitFeeType, marginMode]);
+  }, [balance, riskPercent, entryPrice, stopLoss, takeProfit, leverage, direction, symbol, expectedHoldHours, fundingRate, avgFundingRate, makerFee, takerFee, entryOrderType, exitOrderType, marginMode, slippageBuffer, useConservativeSizing, useDiscount, fundingIntervalHours, entrySlippageBps, exitSlippageBps, manualBalance, useJournalBalance, currentBalance, atr, avgOrderBookDepth]);
 
   const fetchPrice = async () => {
     setIsFetching(true);
@@ -1237,6 +1660,16 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, t
                   className="input-field w-full"
                 />
               </div>
+              <div className="space-y-2">
+                <label className="text-xs font-semibold text-zinc-500 uppercase">Contract Size</label>
+                <input 
+                  type="number"
+                  value={contractSize}
+                  onChange={(e) => setContractSize(Math.max(1, Number(e.target.value)))}
+                  className="input-field w-full"
+                  min="1"
+                />
+              </div>
             </div>
 
             <div className="space-y-2">
@@ -1313,6 +1746,48 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, t
                     className="input-field w-full"
                   />
                 </div>
+                <div className="space-y-2">
+                  <label className="text-xs font-semibold text-zinc-500 uppercase flex items-center gap-1">
+                    Funding Interval (Hrs)
+                    <Clock className="w-3 h-3" />
+                  </label>
+                  <input 
+                    type="number"
+                    value={fundingIntervalHours}
+                    onChange={(e) => setFundingIntervalHours(Number(e.target.value))}
+                    className="input-field w-full"
+                    min="1"
+                  />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 gap-4">
+                <div className="space-y-2">
+                  <label className="text-xs font-semibold text-zinc-500 uppercase flex items-center gap-1">
+                    Entry Slippage (bps)
+                    <ArrowDownLeft className="w-3 h-3 text-rose-500" />
+                  </label>
+                  <input 
+                    type="number"
+                    value={entrySlippageBps}
+                    onChange={(e) => setEntrySlippageBps(Number(e.target.value))}
+                    className="input-field w-full"
+                    min="0"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <label className="text-xs font-semibold text-zinc-500 uppercase flex items-center gap-1">
+                    Exit Slippage (bps)
+                    <ArrowUpRight className="w-3 h-3 text-emerald-500" />
+                  </label>
+                  <input 
+                    type="number"
+                    value={exitSlippageBps}
+                    onChange={(e) => setExitSlippageBps(Number(e.target.value))}
+                    className="input-field w-full"
+                    min="0"
+                  />
+                </div>
               </div>
 
               <div className="p-3 rounded-xl bg-zinc-950/30 border border-zinc-800 space-y-3">
@@ -1346,27 +1821,106 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, t
                     <span className="text-[9px] text-zinc-600 uppercase block">Entry Type</span>
                     <div className="flex bg-zinc-950 rounded-md border border-zinc-800 p-0.5">
                       <button 
-                        onClick={() => setEntryFeeType('MAKER')}
-                        className={cn("flex-1 text-[8px] font-bold py-1 rounded", entryFeeType === 'MAKER' ? "bg-zinc-800 text-emerald-500" : "text-zinc-600")}
+                        onClick={() => setEntryOrderType('MAKER')}
+                        className={cn("flex-1 text-[8px] font-bold py-1 rounded", entryOrderType === 'MAKER' ? "bg-zinc-800 text-emerald-500" : "text-zinc-600")}
                       >MAKER</button>
                       <button 
-                        onClick={() => setEntryFeeType('TAKER')}
-                        className={cn("flex-1 text-[8px] font-bold py-1 rounded", entryFeeType === 'TAKER' ? "bg-zinc-800 text-emerald-500" : "text-zinc-600")}
+                        onClick={() => setEntryOrderType('TAKER')}
+                        className={cn("flex-1 text-[8px] font-bold py-1 rounded", entryOrderType === 'TAKER' ? "bg-zinc-800 text-emerald-500" : "text-zinc-600")}
                       >TAKER</button>
                     </div>
                   </div>
                   <div className="space-y-1">
-                    <span className="text-[9px] text-zinc-600 uppercase block">Exit Type</span>
+                    <span className="text-[9px] text-zinc-600 uppercase block">Exit Type (SL/TP)</span>
                     <div className="flex bg-zinc-950 rounded-md border border-zinc-800 p-0.5">
                       <button 
-                        onClick={() => setExitFeeType('MAKER')}
-                        className={cn("flex-1 text-[8px] font-bold py-1 rounded", exitFeeType === 'MAKER' ? "bg-zinc-800 text-emerald-500" : "text-zinc-600")}
+                        onClick={() => setExitOrderType('MAKER')}
+                        className={cn("flex-1 text-[8px] font-bold py-1 rounded", exitOrderType === 'MAKER' ? "bg-zinc-800 text-emerald-500" : "text-zinc-600")}
                       >MAKER</button>
                       <button 
-                        onClick={() => setExitFeeType('TAKER')}
-                        className={cn("flex-1 text-[8px] font-bold py-1 rounded", exitFeeType === 'TAKER' ? "bg-zinc-800 text-emerald-500" : "text-zinc-600")}
+                        onClick={() => setExitOrderType('TAKER')}
+                        className={cn("flex-1 text-[8px] font-bold py-1 rounded", exitOrderType === 'TAKER' ? "bg-zinc-800 text-emerald-500" : "text-zinc-600")}
                       >TAKER</button>
                     </div>
+                  </div>
+                </div>
+                <div className="flex items-center justify-between pt-1">
+                  <span className="text-[9px] text-zinc-600 uppercase">Use BNB / Referral Discount (10%)</span>
+                  <button 
+                    onClick={() => setUseDiscount(!useDiscount)}
+                    className={cn(
+                      "w-8 h-4 rounded-full relative transition-colors",
+                      useDiscount ? "bg-emerald-500" : "bg-zinc-800"
+                    )}
+                  >
+                    <div className={cn(
+                      "absolute top-0.5 w-3 h-3 rounded-full bg-white transition-all",
+                      useDiscount ? "left-4.5" : "left-0.5"
+                    )} />
+                  </button>
+                </div>
+                <div className="grid grid-cols-2 gap-3 pt-2 border-t border-zinc-800/50">
+                  <div className="space-y-1">
+                    <span className="text-[9px] text-zinc-600 uppercase block">Slippage Buffer %</span>
+                    <div className="flex gap-1 mb-1">
+                      {[
+                        { label: 'Maj', val: 0.15 },
+                        { label: 'Mid', val: 0.40 },
+                        { label: 'Low', val: 1.00 }
+                      ].map(p => (
+                        <button
+                          key={p.label}
+                          onClick={() => setSlippageBuffer(p.val)}
+                          className={cn(
+                            "px-1.5 py-0.5 rounded text-[7px] font-bold border transition-all",
+                            slippageBuffer === p.val 
+                              ? "bg-emerald-500/20 border-emerald-500 text-emerald-500" 
+                              : "bg-zinc-900 border-zinc-800 text-zinc-500 hover:border-zinc-700"
+                          )}
+                        >
+                          {p.label}
+                        </button>
+                      ))}
+                    </div>
+                    <input 
+                      type="number" 
+                      step="0.01"
+                      value={slippageBuffer}
+                      onChange={(e) => setSlippageBuffer(Number(e.target.value))}
+                      className="w-full bg-zinc-950 border border-zinc-800 rounded-md px-2 py-1 text-[10px] font-mono text-zinc-400 focus:outline-none focus:border-emerald-500"
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <div className="flex items-center justify-between">
+                      <span className="text-[9px] text-zinc-600 uppercase block">Conservative Risk</span>
+                      <div className="group relative">
+                        <span className="text-[8px] text-blue-500 cursor-help">Formula</span>
+                        <div className="absolute bottom-full right-0 mb-2 w-56 p-2 bg-zinc-900 border border-zinc-800 rounded shadow-xl opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none z-20">
+                          <p className="text-[7px] text-zinc-400 leading-tight">
+                            <span className="text-emerald-500 font-bold">Exact Friction Model</span><br/>
+                            Risk = Qty × Size × [ |Entry - SL| + Entry × (EntryFee + Slippage + Funding) + SL × (SLFee + Slippage) ]<br/><br/>
+                            <span className="text-emerald-500 font-bold">Conservative Qty</span> = Risk / EffectiveRiskPerContract
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+                    <button 
+                      onClick={() => setUseConservativeSizing(!useConservativeSizing)}
+                      className={cn(
+                        "w-full py-1 rounded-md text-[8px] font-bold border transition-all uppercase tracking-wider",
+                        useConservativeSizing 
+                          ? "bg-emerald-500/10 border-emerald-500/50 text-emerald-500" 
+                          : "bg-zinc-950 border-zinc-800 text-zinc-600"
+                      )}
+                    >
+                      {useConservativeSizing ? "Enabled" : "Disabled"}
+                    </button>
+                    {useConservativeSizing && results && (
+                      <div className="text-[7px] text-zinc-500 font-mono mt-0.5 space-y-0.5">
+                        <div>Total Friction: {(results.totalFrictionRate * 100).toFixed(3)}%</div>
+                        <div className="text-emerald-500/70">Effective SL: {results.effectiveSLDist.toFixed(2)}%</div>
+                      </div>
+                    )}
                   </div>
                 </div>
               </div>
@@ -1496,39 +2050,81 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, t
 
             {/* Position Metrics Section */}
             <div className="crypto-card border-zinc-800/50 bg-zinc-900/30">
-              <div className="flex items-center gap-2 mb-6">
-                <div className="p-2 rounded-lg bg-blue-500/10">
-                  <Activity className="w-5 h-5 text-blue-500" />
+              <div className="flex items-center justify-between mb-6">
+                <div className="flex items-center gap-2">
+                  <div className="p-2 rounded-lg bg-blue-500/10">
+                    <Activity className="w-5 h-5 text-blue-500" />
+                  </div>
+                  <h3 className="text-base font-bold text-zinc-100">Position Metrics</h3>
                 </div>
-                <h3 className="text-base font-bold text-zinc-100">Position Metrics</h3>
+                <div className="flex items-center gap-2 bg-zinc-950 p-1 rounded-lg border border-zinc-800">
+                  <button 
+                    onClick={() => setUseConservativeSizing(false)}
+                    className={cn(
+                      "px-3 py-1 rounded-md text-[10px] font-bold transition-all uppercase tracking-wider",
+                      !results.useConservativeSizing ? "bg-zinc-800 text-zinc-100 shadow-lg" : "text-zinc-600 hover:text-zinc-400"
+                    )}
+                  >
+                    Standard
+                  </button>
+                  <button 
+                    onClick={() => setUseConservativeSizing(true)}
+                    className={cn(
+                      "px-3 py-1 rounded-md text-[10px] font-bold transition-all uppercase tracking-wider",
+                      results.useConservativeSizing ? "bg-emerald-500/20 text-emerald-500 shadow-lg" : "text-zinc-600 hover:text-zinc-400"
+                    )}
+                  >
+                    Conservative
+                  </button>
+                </div>
               </div>
 
               <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
                 <div className="p-4 rounded-xl bg-zinc-950/50 border border-zinc-800/50">
-                  <span className="text-[10px] text-zinc-500 uppercase font-bold block mb-1">Position Size (USDT)</span>
-                  <div className="text-lg font-mono font-bold text-zinc-100">${results.notionalValue.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
+                  <span className="text-[10px] text-zinc-500 uppercase font-bold block mb-1">Position Quantity</span>
+                  <div className="flex items-baseline gap-1">
+                    <span className="text-lg font-mono font-bold text-zinc-100">
+                      {results.quantity.toFixed(results.quantity < 0.01 ? 6 : 4)}
+                    </span>
+                    <span className="text-[10px] text-zinc-600 font-bold">{contractSize > 1 ? 'Contracts' : symbol.replace('USDT', '')}</span>
+                  </div>
+                  <div className="text-[8px] text-zinc-600 uppercase mt-1">
+                    {results.useConservativeSizing ? "Conservative Sizing" : "Standard Sizing"}
+                  </div>
+                </div>
+                <div className="p-4 rounded-xl bg-emerald-500/5 border border-emerald-500/20">
+                  <span className="text-[10px] text-emerald-500/70 uppercase font-bold block mb-1">Active Position (USDT)</span>
+                  <div className="text-lg font-mono font-bold text-emerald-500">
+                    ${results.notionalValue.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                  </div>
+                  <div className="text-[8px] text-zinc-600 uppercase mt-1">Total Notional Value</div>
                 </div>
                 <div className="p-4 rounded-xl bg-zinc-950/50 border border-zinc-800/50">
-                  <span className="text-[10px] text-zinc-500 uppercase font-bold block mb-1">Quantity</span>
+                  <span className="text-[10px] text-zinc-500 uppercase font-bold block mb-1">Leverage Used</span>
                   <div className="flex items-baseline gap-1">
-                    <span className="text-lg font-mono font-bold text-zinc-100">{results.quantity.toFixed(results.quantity < 0.01 ? 6 : 4)}</span>
-                    <span className="text-[10px] text-zinc-500 font-bold">{symbol.replace('USDT', '')}</span>
+                    <span className="text-lg font-mono font-bold text-zinc-100">{results.finalLeverage}x</span>
+                    {results.finalLeverage < leverage && (
+                      <span className="text-[10px] text-rose-500 font-bold">(Capped)</span>
+                    )}
                   </div>
+                  <div className="text-[8px] text-zinc-600 uppercase mt-1">Max for Notional: {results.maxLeverageForThisNotional}x</div>
                 </div>
                 <div className="p-4 rounded-xl bg-zinc-950/50 border border-zinc-800/50">
                   <span className="text-[10px] text-zinc-500 uppercase font-bold block mb-1">Initial Margin</span>
                   <div className="text-lg font-mono font-bold text-zinc-100">${results.initialMargin.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
+                  <div className="text-[8px] text-zinc-600 uppercase mt-1">Notional Limit: ${results.maxNotionalLimit.toLocaleString()}</div>
                 </div>
                 <div className="p-4 rounded-xl bg-blue-500/5 border border-blue-500/20">
                   <span className="text-[10px] text-blue-500/70 uppercase font-bold block mb-1">Risk-to-Reward</span>
-                  <div className={cn("text-lg font-mono font-bold", results.plannedRR >= 2 ? "text-emerald-500" : "text-amber-500")}>
-                    {results.plannedRR.toFixed(2)}:1
+                  <div className={cn("text-lg font-mono font-bold", results.netRR >= 2 ? "text-emerald-500" : "text-amber-500")}>
+                    {results.netRR.toFixed(2)}:1 <span className="text-[10px] text-zinc-600">(Net)</span>
                   </div>
+                  <div className="text-[8px] text-zinc-600 uppercase mt-1">Planned: {results.plannedRR.toFixed(2)}:1</div>
                 </div>
                 <div className="p-4 rounded-xl bg-rose-500/5 border border-rose-500/20">
-                  <span className="text-[10px] text-rose-500/70 uppercase font-bold block mb-1">Risk Amount</span>
-                  <div className="text-lg font-mono font-bold text-rose-500">-${results.riskAmount.toFixed(2)}</div>
-                  <div className="text-[10px] text-rose-500/40 font-mono">≈ Rs. {(results.riskAmount * nprRate).toLocaleString()}</div>
+                  <span className="text-[10px] text-rose-500/70 uppercase font-bold block mb-1">Risk Amount (Net Loss)</span>
+                  <div className="text-lg font-mono font-bold text-rose-500">{results.netPnlAtSL.toFixed(2)}</div>
+                  <div className="text-[10px] text-rose-500/40 font-mono">Target: -${results.riskAmount.toFixed(2)} (≈ Rs. {(results.riskAmount * nprRate).toLocaleString()})</div>
                 </div>
                 <div className={cn(
                   "p-4 rounded-xl border transition-all",
@@ -1549,13 +2145,19 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, t
                   <span className="text-[10px] text-zinc-500 uppercase font-bold block mb-1">Fee Breakdown</span>
                   <div className="space-y-1">
                     <div className="flex justify-between text-[10px]">
-                      <span className="text-zinc-600">Entry ({entryFeeType}):</span>
+                      <span className="text-zinc-600">Entry ({entryOrderType}):</span>
                       <span className="text-zinc-400 font-mono">${results.entryFee.toFixed(2)}</span>
                     </div>
                     <div className="flex justify-between text-[10px]">
-                      <span className="text-zinc-600">Exit ({exitFeeType}):</span>
-                      <span className="text-zinc-400 font-mono">${results.exitFee.toFixed(2)}</span>
+                      <span className="text-zinc-600">Exit SL ({exitOrderType}):</span>
+                      <span className="text-zinc-400 font-mono">${results.exitFeeAtSL.toFixed(2)}</span>
                     </div>
+                    {takeProfit && (
+                      <div className="flex justify-between text-[10px]">
+                        <span className="text-zinc-600">Exit TP ({exitOrderType}):</span>
+                        <span className="text-zinc-400 font-mono">${results.exitFeeAtTP.toFixed(2)}</span>
+                      </div>
+                    )}
                   </div>
                 </div>
               </div>
@@ -1591,7 +2193,7 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, t
                       <span className="text-[10px] text-zinc-500 uppercase font-bold">Net PNL at TP</span>
                       <div className="text-right">
                         <div className="text-sm font-mono font-bold text-emerald-500">+${results.netPnlAtTP.toFixed(2)}</div>
-                        <div className="text-[10px] text-emerald-500/60 font-mono">Incl. ${results.estimatedTotalFees.toFixed(2)} fees</div>
+                        <div className="text-[10px] text-emerald-500/60 font-mono">Incl. ${results.totalTpFriction.toFixed(2)} fees</div>
                         <div className="text-[10px] text-emerald-500/40 font-mono">≈ Rs. {(results.netPnlAtTP * nprRate).toLocaleString()}</div>
                       </div>
                     </div>
@@ -1733,7 +2335,7 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, t
                   </div>
                   <div>
                     <h3 className="text-base font-bold text-zinc-100">Trade Quality Score</h3>
-                    <p className="text-[10px] text-zinc-500 uppercase tracking-tighter">9-Point Risk & Strategy Validation</p>
+                    <p className="text-[10px] text-zinc-500 uppercase tracking-tighter">10-Point Risk & Strategy Validation</p>
                   </div>
                 </div>
                 <div className="flex items-baseline gap-1">
@@ -1744,7 +2346,7 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, t
                   )}>
                     {results.qualityScore}
                   </span>
-                  <span className="text-zinc-600 font-bold">/9</span>
+                  <span className="text-zinc-600 font-bold">/10</span>
                 </div>
               </div>
 
@@ -1787,7 +2389,7 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, t
                   <div>
                     <h4 className="text-[10px] font-bold text-zinc-100 uppercase mb-1">Constructive Advice</h4>
                     <p className="text-[11px] text-zinc-400 leading-relaxed">
-                      {results.qualityScore === 9 
+                      {results.qualityScore === 10 
                         ? "This trade meets all safety and strategy criteria. Execution is highly recommended if the technical setup is valid."
                         : results.qualityScore >= 7
                         ? "Good trade quality, but some parameters could be optimized for better safety or profitability."
@@ -1817,6 +2419,7 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, t
           entryPrice={entryPrice}
           stopLoss={stopLoss}
           takeProfit={takeProfit}
+          contractSize={contractSize}
           currentBalance={currentBalance}
           onClose={() => setIsModalOpen(false)}
           onSave={(trade) => {
@@ -1829,13 +2432,12 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, t
   );
 };
 
-const LogTradeModal = ({ results, symbol, direction, leverage, entryPrice, stopLoss, takeProfit, currentBalance, onClose, onSave }: any) => {
+const LogTradeModal = ({ results, symbol, direction, leverage, entryPrice, stopLoss, takeProfit, contractSize, currentBalance, onClose, onSave }: any) => {
   const [expectedEntryPrice, setExpectedEntryPrice] = useState(entryPrice.toString());
   const [strategy, setStrategy] = useState(STRATEGIES[0]);
   const [timeframe, setTimeframe] = useState(TIMEFRAMES[2]);
   const [notes, setNotes] = useState('');
   const [emotion, setEmotion] = useState(EMOTIONS[4]);
-  const [marketCondition, setMarketCondition] = useState(MARKET_CONDITIONS[0]);
   const [tags, setTags] = useState<string[]>([]);
   const [tagInput, setTagInput] = useState('');
   const [updateGlobalBalance, setUpdateGlobalBalance] = useState(true);
@@ -1877,25 +2479,25 @@ const LogTradeModal = ({ results, symbol, direction, leverage, entryPrice, stopL
       date: new Date().toISOString(),
       symbol,
       direction,
-      leverage,
+      leverage: results.finalLeverage,
       entryPrice,
       expectedEntryPrice: parseFloat(expectedEntryPrice) || entryPrice,
       stopLoss,
       takeProfit: takeProfit || null,
       quantity: results.quantity,
+      contractSize: contractSize,
       notionalValue: results.notionalValue,
       initialMargin: results.initialMargin,
       maintenanceMargin: results.maintenanceMargin,
       liquidationPrice: results.liquidationPrice,
       riskAmount: results.riskAmount,
       pnl: 0,
-      fees: results.notionalValue * 0.0004, // Default fee estimation
+      fees: results.entryFee, // Use calculated entry fee
       netPnl: 0,
       strategy,
       timeframe,
       notes,
       emotion,
-      marketCondition,
       tags,
       status: 'OPEN',
       marginMode: results.marginMode,
@@ -1905,6 +2507,24 @@ const LogTradeModal = ({ results, symbol, direction, leverage, entryPrice, stopL
       safetyBufferAtEntry: results.safetyBuffer,
       liqDistAtEntry: results.distToLiq,
       entryImage1h: entryImage1h || undefined,
+      // Real Binance matching update – April 2026
+      entryOrderType: results.entryOrderType || 'TAKER',
+      exitOrderType: results.exitOrderType || 'TAKER',
+      estimatedHoldHours: results.estimatedHoldHours || 24,
+      fundingRatePerInterval: results.fundingRatePerInterval || 0.01,
+      fundingIntervalHours: results.fundingIntervalHours || 8,
+      entrySlippageBps: results.entrySlippageBps || 5,
+      exitSlippageBps: results.exitSlippageBps || 8,
+      useDiscount: results.useDiscount || false,
+      makerFee: results.makerFee || 0.02,
+      takerFee: results.takerFee || 0.05,
+      fundingPnL: 0,
+      effectiveEntryPrice: results.effectiveEntryPrice || entryPrice,
+      effectiveExitPrice: results.effectiveExitPrice || (takeProfit || stopLoss),
+      atr: results.atr,
+      avgOrderBookDepth: results.avgOrderBookDepth,
+      avgFundingRate: results.avgFundingRate,
+      adjustedRiskPercent: results.adjustedRiskPercent
     };
     onSave(trade);
   };
@@ -2000,16 +2620,6 @@ const LogTradeModal = ({ results, symbol, direction, leverage, entryPrice, stopL
                   className="input-field w-full"
                 >
                   {EMOTIONS.map(e => <option key={e} value={e}>{e}</option>)}
-                </select>
-              </div>
-              <div className="space-y-2">
-                <label className="text-xs font-semibold text-zinc-500 uppercase">Market Condition</label>
-                <select 
-                  value={marketCondition}
-                  onChange={(e) => setMarketCondition(e.target.value)}
-                  className="input-field w-full"
-                >
-                  {MARKET_CONDITIONS.map(m => <option key={m} value={m}>{m}</option>)}
                 </select>
               </div>
               <div className="space-y-2">
@@ -2492,7 +3102,6 @@ const EditTradeModal = ({ trade, onClose, onSave }: { trade: Trade, onClose: () 
   const [timeframe, setTimeframe] = useState(trade.timeframe);
   const [notes, setNotes] = useState(trade.notes);
   const [emotion, setEmotion] = useState(trade.emotion);
-  const [marketCondition, setMarketCondition] = useState(trade.marketCondition);
   const [tags, setTags] = useState<string[]>(trade.tags || []);
   const [tagInput, setTagInput] = useState('');
   const [marginMode, setMarginMode] = useState<'ISOLATED' | 'CROSS'>(trade.marginMode || 'ISOLATED');
@@ -2556,7 +3165,6 @@ const EditTradeModal = ({ trade, onClose, onSave }: { trade: Trade, onClose: () 
       timeframe,
       notes,
       emotion,
-      marketCondition,
       tags,
       marginMode,
       entryImage1h: entryImage1h || undefined,
@@ -2720,16 +3328,6 @@ const EditTradeModal = ({ trade, onClose, onSave }: { trade: Trade, onClose: () 
             </div>
 
             <div className="space-y-4">
-              <div className="space-y-2">
-                <label className="text-xs font-semibold text-zinc-500 uppercase">Market Condition</label>
-                <select 
-                  value={marketCondition}
-                  onChange={(e) => setMarketCondition(e.target.value)}
-                  className="input-field w-full"
-                >
-                  {MARKET_CONDITIONS.map(m => <option key={m} value={m}>{m}</option>)}
-                </select>
-              </div>
               <div className="space-y-2">
                 <label className="text-xs font-semibold text-zinc-500 uppercase">Tags</label>
                 <div className="flex flex-wrap gap-2 mb-2">
@@ -2931,9 +3529,31 @@ const AddMarginModal = ({ trade, onClose, onSave }: { trade: Trade, onClose: () 
     const val = parseFloat(amount);
     if (isNaN(val) || val <= 0) return;
     
+    const newAddedMargin = (trade.addedMargin || 0) + val;
+    const totalMargin = trade.initialMargin + newAddedMargin;
+    
+    // Recalculate Liquidation Price
+    // We need to re-estimate maintenance margin based on notional value
+    const tiers = SYMBOL_MMR_TIERS[trade.symbol] || SYMBOL_MMR_TIERS['DEFAULT'];
+    const tier = tiers.find(t => trade.notionalValue <= t.bracket) || tiers[tiers.length - 1];
+    const mmr = tier.mmr;
+    const maintenanceAmount = tier.maintenanceAmount;
+    
+    // Approximate liquidation fee (taker fee)
+    // We don't have takerFee here, but we can assume a standard 0.05% or use what's in the trade if we stored it.
+    // Looking at the trade object, it doesn't store the fee rates. 
+    // Let's use a standard 0.05% for the liquidation fee buffer.
+    const liqFee = trade.notionalValue * 0.0005; 
+    const maintenanceMargin = (trade.notionalValue * mmr) - maintenanceAmount + liqFee;
+
+    const newLiquidationPrice = trade.direction === 'LONG'
+      ? trade.entryPrice - ((totalMargin - maintenanceMargin) / trade.quantity)
+      : trade.entryPrice + ((totalMargin - maintenanceMargin) / trade.quantity);
+
     const updated: Trade = {
       ...trade,
-      addedMargin: (trade.addedMargin || 0) + val
+      addedMargin: newAddedMargin,
+      liquidationPrice: Math.max(0, newLiquidationPrice)
     };
     onSave(updated);
     onClose();
@@ -3214,7 +3834,7 @@ const JournalTab = ({
       'ID', 'Date', 'Symbol', 'Direction', 'Strategy', 'Timeframe', 'Status',
       'Entry Price', 'Exit Price', 'Quantity', 'Leverage', 'Notional Value',
       'Risk Amount', 'PNL', 'Fees', 'Net PNL', 'Planned RR', 'Actual RR',
-      'MFE %', 'MAE %', 'Efficiency %', 'Followed Plan', 'Emotion', 'Market Condition',
+      'MFE %', 'MAE %', 'Efficiency %', 'Followed Plan', 'Emotion',
       'Notes', 'Tags'
     ];
 
@@ -3242,8 +3862,7 @@ const JournalTab = ({
       t.exitEfficiency !== undefined ? t.exitEfficiency : '',
       t.followedPlan || '',
       t.emotion || '',
-      t.marketCondition || '',
-      `"${(t.notes || '').replace(/"/g, '""')}"`,
+      t.notes || '',
       `"${(t.tags || []).join(', ')}"`
     ]);
 
@@ -3878,8 +4497,11 @@ const JournalTab = ({
                         <span className="text-xs text-zinc-100 font-mono">${t.riskAmount.toFixed(2)}</span>
                       </div>
                       <div className="flex items-center gap-2">
-                        <span className="text-[10px] text-zinc-500 font-mono w-3">Q</span>
-                        <span className="text-xs text-zinc-100 font-mono">{t.quantity.toFixed(4)}</span>
+                        <span className="text-[10px] text-zinc-500 font-mono w-3">M</span>
+                        <span className="text-xs text-zinc-100 font-mono">${(t.initialMargin + (t.addedMargin || 0)).toFixed(2)}</span>
+                        {t.addedMargin > 0 && (
+                          <span className="text-[9px] text-emerald-500 font-bold">+{t.addedMargin.toFixed(1)}</span>
+                        )}
                       </div>
                     </div>
                   </td>
@@ -3897,6 +4519,12 @@ const JournalTab = ({
                         <div className="flex items-center gap-2">
                           <span className="text-[10px] text-zinc-500 font-mono w-4">TP</span>
                           <span className="text-xs text-zinc-100 font-mono text-emerald-400">{t.takeProfit.toLocaleString()}</span>
+                        </div>
+                      )}
+                      {t.status === 'OPEN' && t.liquidationPrice > 0 && (
+                        <div className="flex items-center gap-2">
+                          <span className="text-[10px] text-amber-500 font-bold font-mono w-4">LQ</span>
+                          <span className="text-xs text-amber-500 font-mono font-bold">{t.liquidationPrice.toLocaleString()}</span>
                         </div>
                       )}
                     </div>
@@ -4528,15 +5156,6 @@ const StatsTab = ({ trades, startingBalance, balanceHistory }: any) => {
     // Funding Cost Summary
     const totalFundingFees = closed.reduce((acc, t) => acc + (t.fundingFee || 0), 0);
 
-    // Win rate by market regime
-    const regimeStats: Record<string, { wins: number, total: number }> = {};
-    closed.forEach(t => {
-      const regime = t.marketCondition || 'UNKNOWN';
-      if (!regimeStats[regime]) regimeStats[regime] = { wins: 0, total: 0 };
-      regimeStats[regime].total++;
-      if (t.netPnl > 0) regimeStats[regime].wins++;
-    });
-
     // Psychological Metrics
     const emotionStats: Record<string, { wins: number, total: number, pnl: number }> = {};
     closed.forEach(t => {
@@ -4621,7 +5240,6 @@ const StatsTab = ({ trades, startingBalance, balanceHistory }: any) => {
       avgMfe,
       avgMae,
       strategyStats,
-      regimeStats,
       emotionStats,
       revengeTradeStats,
       hourlyData,
@@ -4771,35 +5389,6 @@ const StatsTab = ({ trades, startingBalance, balanceHistory }: any) => {
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        {/* Market Regime Analysis */}
-        <div className="crypto-card p-6">
-          <h3 className="text-sm font-bold uppercase text-zinc-500 mb-6 flex items-center gap-2">
-            <Activity className="w-4 h-4" /> Market Regime Analysis
-          </h3>
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-            {Object.entries(stats.regimeStats).map(([regime, data]: [string, any]) => {
-              const wr = (data.wins / data.total) * 100;
-              return (
-                <div key={regime} className="p-4 bg-zinc-950 rounded-xl border border-zinc-800">
-                  <div className="flex justify-between items-center mb-2">
-                    <span className="text-xs font-bold text-zinc-200">{regime}</span>
-                    <span className={cn("text-xs font-bold", wr >= 50 ? "text-emerald-500" : "text-rose-500")}>
-                      {wr.toFixed(1)}%
-                    </span>
-                  </div>
-                  <div className="h-1.5 bg-zinc-900 rounded-full overflow-hidden">
-                    <div className={cn("h-full", wr >= 50 ? "bg-emerald-500" : "bg-rose-500")} style={{ width: `${wr}%` }} />
-                  </div>
-                  <div className="mt-2 flex justify-between text-[10px] text-zinc-500">
-                    <span>{data.total} trades</span>
-                    <span>{data.wins}W - {data.total - data.wins}L</span>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        </div>
-
         {/* Psychological Metrics */}
         <div className="crypto-card p-6">
           <h3 className="text-sm font-bold uppercase text-zinc-500 mb-6 flex items-center gap-2">

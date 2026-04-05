@@ -47,8 +47,6 @@ export const TIMEFRAMES = ['1m', '5m', '15m', '1h', '4h', '1d', '1w'];
 
 export const EMOTIONS = ['Confident', 'Anxious', 'Greedy', 'Fearful', 'Neutral', 'FOMO'];
 
-export const MARKET_CONDITIONS = ['Trending Up', 'Trending Down', 'Ranging', 'Volatile', 'Choppy'];
-
 export const PREDEFINED_TAGS = [
   '#breakeven', '#trailed', '#overleveraged', '#news', '#FOMO', 
   '#revenge', '#plan-followed', '#early-exit', '#fat-finger', '#liquidity-grab'

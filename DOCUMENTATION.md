@@ -133,7 +133,6 @@ interface Trade {
   mfePercent?: number;
   maePercent?: number;
   emotion: string;
-  marketCondition: string;
   // ... and more
 }
 ```
