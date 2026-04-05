@@ -35,7 +35,6 @@ export interface Trade {
   status: 'OPEN' | 'CLOSED';
   marginMode: 'ISOLATED' | 'CROSS';
   addedMargin: number;
-  contractSize?: number;
   plannedRR: number;
   actualRR?: number;
   balanceBefore: number;
@@ -62,8 +61,6 @@ export interface Trade {
   estimatedHoldHours?: number;
   fundingRatePerInterval?: number;
   fundingIntervalHours?: number;
-  entrySlippageBps?: number;
-  exitSlippageBps?: number;
   effectiveEntryPrice?: number;
   effectiveExitPrice?: number;
   fundingPnL?: number;

@@ -207,14 +207,11 @@ const calculateRealWorldFriction = (params: {
   fundingRatePerInterval: number;
   avgFundingRate: number;
   fundingIntervalHours: number;
-  entrySlippageBps: number;
-  exitSlippageBps: number;
   atr: number;
   avgOrderBookDepth: number;
   useDiscount: boolean;
   makerFee: number;
   takerFee: number;
-  contractSize: number;
 }) => {
   const {
     entryPrice,
@@ -227,25 +224,22 @@ const calculateRealWorldFriction = (params: {
     fundingRatePerInterval,
     avgFundingRate,
     fundingIntervalHours,
-    entrySlippageBps,
-    exitSlippageBps,
     atr,
     avgOrderBookDepth,
     useDiscount,
     makerFee,
     takerFee,
-    contractSize
   } = params;
 
   const discountMultiplier = useDiscount ? 0.9 : 1.0;
   const entryFeeRate = (entryOrderType === 'MAKER' ? makerFee : takerFee) * discountMultiplier / 100;
   const exitFeeRate = (exitOrderType === 'MAKER' ? makerFee : takerFee) * discountMultiplier / 100;
 
-  const notionalValue = quantity * contractSize * entryPrice;
+  const notionalValue = quantity * entryPrice;
 
   // Use dynamic slippage model
   const entrySlippage = calculateDynamicSlippage({
-    baseSlippageBps: entrySlippageBps,
+    baseSlippageBps: 5, // Default 5 bps
     atr,
     entryPrice,
     notionalValue,
@@ -254,10 +248,10 @@ const calculateRealWorldFriction = (params: {
   });
 
   const exitSlippage = calculateDynamicSlippage({
-    baseSlippageBps: exitSlippageBps,
+    baseSlippageBps: 8, // Default 8 bps
     atr,
     entryPrice: stopLoss,
-    notionalValue: quantity * contractSize * stopLoss,
+    notionalValue: quantity * stopLoss,
     avgOrderBookDepth,
     orderType: exitOrderType
   });
@@ -278,7 +272,7 @@ const calculateRealWorldFriction = (params: {
     intervalHours: fundingIntervalHours
   });
 
-  const totalFundingPnL = quantity * contractSize * entryPrice * fundingRateTotal;
+  const totalFundingPnL = quantity * entryPrice * fundingRateTotal;
 
   const totalFrictionRate = entryFeeRate + exitFeeRate + entrySlippage + exitSlippage + Math.abs(fundingRateTotal);
 
@@ -335,12 +329,9 @@ const calculateTradeMetrics = (trade: Partial<Trade> & {
   estimatedHoldHours?: number,
   fundingRatePerInterval?: number,
   fundingIntervalHours?: number,
-  entrySlippageBps?: number,
-  exitSlippageBps?: number,
   useDiscount?: boolean,
   makerFee?: number,
   takerFee?: number,
-  contractSize?: number
 }) => {
   const { 
     entryPrice, 
@@ -357,14 +348,11 @@ const calculateTradeMetrics = (trade: Partial<Trade> & {
     fundingRatePerInterval = 0.01,
     avgFundingRate = 0.01,
     fundingIntervalHours = 8,
-    entrySlippageBps = 5,
-    exitSlippageBps = 8,
     atr = 0,
     avgOrderBookDepth = 1000000,
     useDiscount = false,
     makerFee = 0.02,
     takerFee = 0.05,
-    contractSize = 1
   } = trade;
   
   if (exitPrice === undefined) return null;
@@ -381,14 +369,11 @@ const calculateTradeMetrics = (trade: Partial<Trade> & {
     fundingRatePerInterval,
     avgFundingRate,
     fundingIntervalHours,
-    entrySlippageBps,
-    exitSlippageBps,
     atr,
     avgOrderBookDepth,
     useDiscount,
     makerFee,
     takerFee,
-    contractSize
   });
 
   const effectiveEntryPrice = friction.effectiveEntryPrice;
@@ -399,17 +384,17 @@ const calculateTradeMetrics = (trade: Partial<Trade> & {
   
   // Gross PnL using effective prices
   const pnl = direction === 'LONG' 
-    ? (effectiveExitPrice - effectiveEntryPrice) * quantity * (contractSize || 1)
-    : (effectiveEntryPrice - effectiveExitPrice) * quantity * (contractSize || 1);
+    ? (effectiveExitPrice - effectiveEntryPrice) * quantity
+    : (effectiveEntryPrice - effectiveExitPrice) * quantity;
   
   const netPnl = pnl - fees + fundingPnL;
-  const actualRR = pnl / (riskPerUnit * quantity * (contractSize || 1));
+  const actualRR = pnl / (riskPerUnit * quantity);
 
   // Exit Efficiency: How much of the maximum favorable move was captured
   let mfePrice = direction === 'LONG' ? (highestPriceReached || exitPrice) : (lowestPriceReached || exitPrice);
   const maxPossiblePnl = direction === 'LONG'
-    ? (mfePrice - effectiveEntryPrice) * quantity * (contractSize || 1)
-    : (effectiveEntryPrice - mfePrice) * quantity * (contractSize || 1);
+    ? (mfePrice - effectiveEntryPrice) * quantity
+    : (effectiveEntryPrice - mfePrice) * quantity;
 
   const exitEfficiency = maxPossiblePnl > 0 && pnl > 0 
     ? (pnl / maxPossiblePnl) * 100 
@@ -541,18 +526,21 @@ export default function App() {
   useEffect(() => {
     const fetchNprRate = async () => {
       try {
-        const res = await fetch('https://api.exchangerate-api.com/v4/latest/USD');
+        const res = await fetch('https://open.er-api.com/v6/latest/USD');
+        if (!res.ok) throw new Error('Network response was not ok');
         const data = await res.json();
         if (data.rates && data.rates.NPR) {
           setNprRate(data.rates.NPR);
         }
       } catch (e) {
         console.error("Failed to fetch NPR rate", e);
+        // Fallback to a reasonable default if fetch fails
+        setNprRate(134);
       }
     };
     fetchNprRate();
-    // Refresh every 30 minutes
-    const interval = setInterval(fetchNprRate, 30 * 60 * 1000);
+    // Refresh every 60 minutes
+    const interval = setInterval(fetchNprRate, 60 * 60 * 1000);
     return () => clearInterval(interval);
   }, []);
 
@@ -1143,8 +1131,6 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, t
   const [fundingIntervalHours, setFundingIntervalHours] = useState(8);
   const [atr, setAtr] = useState(0); // Average True Range
   const [avgOrderBookDepth, setAvgOrderBookDepth] = useState(1000000); // Default $1M depth for majors
-  const [entrySlippageBps, setEntrySlippageBps] = useState(5);
-  const [exitSlippageBps, setExitSlippageBps] = useState(8);
   const [makerFee, setMakerFee] = useState(0.02); // 0.02% (2026 Standard)
   const [takerFee, setTakerFee] = useState(0.05); // 0.05% (2026 Standard)
   const [useDiscount, setUseDiscount] = useState(false); // BNB/Referral Discount
@@ -1152,7 +1138,6 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, t
   const [exitOrderType, setExitOrderType] = useState<'MAKER' | 'TAKER'>('TAKER');
   const [marginMode, setMarginMode] = useState<'ISOLATED' | 'CROSS'>('ISOLATED');
   const [slippageBuffer, setSlippageBuffer] = useState(0.15); // 0.15% (2026 Standard for Majors)
-  const [contractSize, setContractSize] = useState(1); // 1 unit per contract
   const [useConservativeSizing, setUseConservativeSizing] = useState(true);
   const [isFetching, setIsFetching] = useState(false);
   const [isModalOpen, setIsModalOpen] = useState(false);
@@ -1263,7 +1248,10 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, t
     const priceDiff = direction === 'LONG' ? (entryPrice - stopLoss) : (stopLoss - entryPrice);
     
     // Ensure priceDiff is positive for valid trades (SL must be below entry for LONG, above for SHORT)
-    if (priceDiff <= 0) return null;
+    if (priceDiff <= 0) {
+      console.warn(`Invalid priceDiff for ${direction}: ${priceDiff}. Entry: ${entryPrice}, SL: ${stopLoss}`);
+      return null;
+    }
 
     // Real Binance matching update – April 2026
     const friction = calculateRealWorldFriction({
@@ -1277,14 +1265,11 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, t
       fundingRatePerInterval: fundingRate,
       avgFundingRate,
       fundingIntervalHours,
-      entrySlippageBps,
-      exitSlippageBps,
       atr,
       avgOrderBookDepth,
       useDiscount,
       makerFee,
       takerFee,
-      contractSize
     });
 
     const totalFrictionRate = friction.totalFrictionRate;
@@ -1296,30 +1281,30 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, t
     const fundingRateTotal = friction.fundingRateTotal;
     
     // 1. Calculate raw quantities from risk
-    const priceDiffPerContract = priceDiff * contractSize;
-    const effectiveRiskPerContract = (priceDiff + (entryPrice * totalFrictionRate)) * contractSize;
+    const priceDiffPerContract = priceDiff;
+    const effectiveRiskPerContract = (priceDiff + (entryPrice * totalFrictionRate));
     
     let rawConservativeQuantity = riskAmount / effectiveRiskPerContract;
     let rawStandardQuantity = riskAmount / priceDiffPerContract;
 
     // 2. Apply REAL Binance constraints
     const maxNotionalLimit = getSymbolNotionalLimit(symbol);
-    const maxQuantityByNotional = maxNotionalLimit / (entryPrice * contractSize);
+    const maxQuantityByNotional = maxNotionalLimit / entryPrice;
 
     // Conservative constraints
-    const maxLeverageCons = getMaxLeverageForNotional(symbol, rawConservativeQuantity * contractSize * entryPrice);
+    const maxLeverageCons = getMaxLeverageForNotional(symbol, rawConservativeQuantity * entryPrice);
     const finalLeverageCons = Math.min(leverage, maxLeverageCons);
-    const maxQtyBalanceCons = (balance * finalLeverageCons) / (entryPrice * contractSize);
+    const maxQtyBalanceCons = (balance * finalLeverageCons) / entryPrice;
     const finalConsQuantity = Math.min(rawConservativeQuantity, maxQtyBalanceCons, maxQuantityByNotional);
 
     // Standard constraints
-    const maxLeverageStd = getMaxLeverageForNotional(symbol, rawStandardQuantity * contractSize * entryPrice);
+    const maxLeverageStd = getMaxLeverageForNotional(symbol, rawStandardQuantity * entryPrice);
     const finalLeverageStd = Math.min(leverage, maxLeverageStd);
-    const maxQtyBalanceStd = (balance * finalLeverageStd) / (entryPrice * contractSize);
+    const maxQtyBalanceStd = (balance * finalLeverageStd) / entryPrice;
     const finalStdQuantity = Math.min(rawStandardQuantity, maxQtyBalanceStd, maxQuantityByNotional);
 
     // 7. Round down to contract step size (Binance minimum quantity precision)
-    const stepSize = contractSize > 1 ? 1 : 0.001;
+    const stepSize = 0.001;
     const conservativeQuantity = Math.floor(finalConsQuantity / stepSize) * stepSize;
     const standardQuantity = Math.floor(finalStdQuantity / stepSize) * stepSize;
 
@@ -1327,10 +1312,10 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, t
     const quantity = useConservativeSizing ? conservativeQuantity : standardQuantity;
     const finalLeverage = useConservativeSizing ? finalLeverageCons : finalLeverageStd;
     const maxLeverageForThisNotional = useConservativeSizing ? maxLeverageCons : maxLeverageStd;
-    const notionalValue = quantity * contractSize * entryPrice;
+    const notionalValue = quantity * entryPrice;
     
-    const standardNotionalValue = standardQuantity * contractSize * entryPrice;
-    const conservativeNotionalValue = conservativeQuantity * contractSize * entryPrice;
+    const standardNotionalValue = standardQuantity * entryPrice;
+    const conservativeNotionalValue = conservativeQuantity * entryPrice;
 
     // MMR Tier calculation
     const tiers = SYMBOL_MMR_TIERS[symbol] || SYMBOL_MMR_TIERS['DEFAULT'];
@@ -1343,8 +1328,8 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, t
 
     // Fee Calculation
     const entryFee = notionalValue * entryFeeRate;
-    const exitFeeAtSL = (quantity * contractSize * stopLoss) * slFeeRate;
-    const exitFeeAtTP = takeProfit ? (quantity * contractSize * takeProfit) * tpFeeRate : exitFeeAtSL;
+    const exitFeeAtSL = (quantity * stopLoss) * slFeeRate;
+    const exitFeeAtTP = takeProfit ? (quantity * takeProfit) * tpFeeRate : exitFeeAtSL;
     
     // Taker fee for liquidation (exchanges charge this to close the position)
     const liqFeeRate = takerFee / 100;
@@ -1362,15 +1347,15 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, t
 
     // Bankruptcy Price
     const bankruptcyPrice = direction === 'LONG' 
-      ? entryPrice - (initialMargin / (quantity * contractSize))
-      : entryPrice + (initialMargin / (quantity * contractSize));
+      ? entryPrice - (initialMargin / quantity)
+      : entryPrice + (initialMargin / quantity);
 
     const marginInPosition = marginMode === 'CROSS' ? balance : initialMargin;
-    const totalUnits = quantity * contractSize;
+    const totalUnits = quantity;
 
     const liquidationPrice = direction === 'LONG'
-      ? (entryPrice * totalUnits - marginInPosition - maintenanceAmount) / (totalUnits * (1 - mmr - liqFeeRate))
-      : (entryPrice * totalUnits + marginInPosition + maintenanceAmount) / (totalUnits * (1 + mmr + liqFeeRate));
+      ? (totalUnits > 0 ? (entryPrice * totalUnits - marginInPosition - maintenanceAmount) / (totalUnits * (1 - mmr - liqFeeRate)) : 0)
+      : (totalUnits > 0 ? (entryPrice * totalUnits + marginInPosition + maintenanceAmount) / (totalUnits * (1 + mmr + liqFeeRate)) : 0);
 
     // Simple Liquidation
     const simpleLiq = direction === 'LONG'
@@ -1382,8 +1367,8 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, t
     const distToLiq = (Math.abs(entryPrice - liquidationPrice) / entryPrice) * 100;
     const safetyBuffer = distToLiq / distToSL;
 
-    const pnlAtSL = (direction === 'LONG' ? (stopLoss - entryPrice) : (entryPrice - stopLoss)) * quantity * contractSize;
-    const pnlAtTP = takeProfit ? (direction === 'LONG' ? (takeProfit - entryPrice) : (entryPrice - takeProfit)) * quantity * contractSize : 0;
+    const pnlAtSL = (direction === 'LONG' ? (stopLoss - entryPrice) : (entryPrice - stopLoss)) * quantity;
+    const pnlAtTP = takeProfit ? (direction === 'LONG' ? (takeProfit - entryPrice) : (entryPrice - takeProfit)) * quantity : 0;
     
     // 1. Net PnL at Stop Loss (Exactly -riskAmount when conservative sizing is used)
     const priceLoss = Math.abs(pnlAtSL);
@@ -1550,18 +1535,28 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, t
       atr,
       avgOrderBookDepth
     };
-  }, [balance, riskPercent, entryPrice, stopLoss, takeProfit, leverage, direction, symbol, expectedHoldHours, fundingRate, avgFundingRate, makerFee, takerFee, entryOrderType, exitOrderType, marginMode, slippageBuffer, useConservativeSizing, useDiscount, fundingIntervalHours, entrySlippageBps, exitSlippageBps, manualBalance, useJournalBalance, currentBalance, atr, avgOrderBookDepth]);
+  }, [balance, riskPercent, entryPrice, stopLoss, takeProfit, leverage, direction, symbol, expectedHoldHours, fundingRate, avgFundingRate, makerFee, takerFee, entryOrderType, exitOrderType, marginMode, slippageBuffer, useConservativeSizing, useDiscount, fundingIntervalHours, manualBalance, useJournalBalance, currentBalance, atr, avgOrderBookDepth]);
 
   const fetchPrice = async () => {
+    if (!symbol) return;
     setIsFetching(true);
     try {
       const res = await fetch(`https://fapi.binance.com/fapi/v1/ticker/price?symbol=${symbol.toUpperCase()}`);
+      if (!res.ok) throw new Error('Binance API response not ok');
       const data = await res.json();
       if (data.price) {
         setEntryPrice(parseFloat(data.price));
       }
     } catch (e) {
       console.error("Failed to fetch price", e);
+      // Try a different public API if Binance fails
+      try {
+        const res = await fetch(`https://api.binance.com/api/v3/ticker/price?symbol=${symbol.toUpperCase()}`);
+        const data = await res.json();
+        if (data.price) setEntryPrice(parseFloat(data.price));
+      } catch (innerE) {
+        console.error("All price fetch attempts failed", innerE);
+      }
     } finally {
       setIsFetching(false);
     }
@@ -1660,16 +1655,6 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, t
                   className="input-field w-full"
                 />
               </div>
-              <div className="space-y-2">
-                <label className="text-xs font-semibold text-zinc-500 uppercase">Contract Size</label>
-                <input 
-                  type="number"
-                  value={contractSize}
-                  onChange={(e) => setContractSize(Math.max(1, Number(e.target.value)))}
-                  className="input-field w-full"
-                  min="1"
-                />
-              </div>
             </div>
 
             <div className="space-y-2">
@@ -1757,35 +1742,6 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, t
                     onChange={(e) => setFundingIntervalHours(Number(e.target.value))}
                     className="input-field w-full"
                     min="1"
-                  />
-                </div>
-              </div>
-
-              <div className="grid grid-cols-2 gap-4">
-                <div className="space-y-2">
-                  <label className="text-xs font-semibold text-zinc-500 uppercase flex items-center gap-1">
-                    Entry Slippage (bps)
-                    <ArrowDownLeft className="w-3 h-3 text-rose-500" />
-                  </label>
-                  <input 
-                    type="number"
-                    value={entrySlippageBps}
-                    onChange={(e) => setEntrySlippageBps(Number(e.target.value))}
-                    className="input-field w-full"
-                    min="0"
-                  />
-                </div>
-                <div className="space-y-2">
-                  <label className="text-xs font-semibold text-zinc-500 uppercase flex items-center gap-1">
-                    Exit Slippage (bps)
-                    <ArrowUpRight className="w-3 h-3 text-emerald-500" />
-                  </label>
-                  <input 
-                    type="number"
-                    value={exitSlippageBps}
-                    onChange={(e) => setExitSlippageBps(Number(e.target.value))}
-                    className="input-field w-full"
-                    min="0"
                   />
                 </div>
               </div>
@@ -2086,7 +2042,7 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, t
                     <span className="text-lg font-mono font-bold text-zinc-100">
                       {results.quantity.toFixed(results.quantity < 0.01 ? 6 : 4)}
                     </span>
-                    <span className="text-[10px] text-zinc-600 font-bold">{contractSize > 1 ? 'Contracts' : symbol.replace('USDT', '')}</span>
+                    <span className="text-[10px] text-zinc-600 font-bold">{symbol.replace('USDT', '')}</span>
                   </div>
                   <div className="text-[8px] text-zinc-600 uppercase mt-1">
                     {results.useConservativeSizing ? "Conservative Sizing" : "Standard Sizing"}
@@ -2404,8 +2360,21 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, t
         ) : (
           <div className="h-full flex flex-col items-center justify-center text-zinc-700 py-20 border-2 border-dashed border-zinc-900 rounded-2xl">
             <Calculator className="w-16 h-16 mb-4 opacity-20" />
-            <p className="text-lg font-medium">Ready to calculate your risk?</p>
-            <p className="text-sm">Enter your trade parameters on the left to see advanced analytics.</p>
+            {entryPrice > 0 && stopLoss > 0 ? (
+              <div className="text-center px-6">
+                <p className="text-lg font-medium text-rose-500">Invalid Trade Parameters</p>
+                <p className="text-sm text-zinc-500 mt-2">
+                  {direction === 'LONG' 
+                    ? "For LONG: Stop Loss must be BELOW Entry Price" 
+                    : "For SHORT: Stop Loss must be ABOVE Entry Price"}
+                </p>
+              </div>
+            ) : (
+              <>
+                <p className="text-lg font-medium">Ready to calculate your risk?</p>
+                <p className="text-sm">Enter your trade parameters on the left to see advanced analytics.</p>
+              </>
+            )}
           </div>
         )}
       </div>
@@ -2419,7 +2388,6 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, t
           entryPrice={entryPrice}
           stopLoss={stopLoss}
           takeProfit={takeProfit}
-          contractSize={contractSize}
           currentBalance={currentBalance}
           onClose={() => setIsModalOpen(false)}
           onSave={(trade) => {
@@ -2432,7 +2400,7 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, t
   );
 };
 
-const LogTradeModal = ({ results, symbol, direction, leverage, entryPrice, stopLoss, takeProfit, contractSize, currentBalance, onClose, onSave }: any) => {
+const LogTradeModal = ({ results, symbol, direction, leverage, entryPrice, stopLoss, takeProfit, currentBalance, onClose, onSave }: any) => {
   const [expectedEntryPrice, setExpectedEntryPrice] = useState(entryPrice.toString());
   const [strategy, setStrategy] = useState(STRATEGIES[0]);
   const [timeframe, setTimeframe] = useState(TIMEFRAMES[2]);
@@ -2485,7 +2453,6 @@ const LogTradeModal = ({ results, symbol, direction, leverage, entryPrice, stopL
       stopLoss,
       takeProfit: takeProfit || null,
       quantity: results.quantity,
-      contractSize: contractSize,
       notionalValue: results.notionalValue,
       initialMargin: results.initialMargin,
       maintenanceMargin: results.maintenanceMargin,
@@ -2513,8 +2480,6 @@ const LogTradeModal = ({ results, symbol, direction, leverage, entryPrice, stopL
       estimatedHoldHours: results.estimatedHoldHours || 24,
       fundingRatePerInterval: results.fundingRatePerInterval || 0.01,
       fundingIntervalHours: results.fundingIntervalHours || 8,
-      entrySlippageBps: results.entrySlippageBps || 5,
-      exitSlippageBps: results.exitSlippageBps || 8,
       useDiscount: results.useDiscount || false,
       makerFee: results.makerFee || 0.02,
       takerFee: results.takerFee || 0.05,
