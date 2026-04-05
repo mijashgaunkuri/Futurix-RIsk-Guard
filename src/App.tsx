@@ -1226,7 +1226,6 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, t
       takerFee,
     });
 
-    const totalFrictionRate = friction.totalFrictionRate;
     const entryFeeRate = friction.entryFeeRate;
     const slFeeRate = friction.exitSlFeeRate; // SL is exit friction
     const tpFeeRate = friction.exitTpFeeRate; // TP is exit friction
@@ -1236,7 +1235,17 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, t
     
     // 1. Calculate raw quantities from risk
     const priceDiffPerContract = priceDiff;
-    const effectiveRiskPerContract = (priceDiff + (entryPrice * totalFrictionRate));
+    
+    // Correct Engineering Approach for Effective Risk
+    const entryFeePerUnit = entryPrice * entryFeeRate;
+    const exitFeePerUnit = stopLoss * slFeeRate;
+    const slippagePerUnit = entryPrice * slippageRate;
+    const fundingPerUnit = entryPrice * Math.abs(fundingRateTotal);
+    
+    const effectiveRiskPerContract = priceDiff + entryFeePerUnit + exitFeePerUnit + slippagePerUnit + fundingPerUnit;
+    
+    // Effective friction rate relative to entry price for display and other calculations
+    const effectiveFrictionRate = (effectiveRiskPerContract - priceDiff) / entryPrice;
     
     let rawConservativeQuantity = riskAmount / effectiveRiskPerContract;
     let rawStandardQuantity = riskAmount / priceDiffPerContract;
@@ -1317,7 +1326,7 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, t
       : entryPrice * (1 + 1 / finalLeverage + 0.005);
 
     const distToSL = (Math.abs(entryPrice - stopLoss) / entryPrice) * 100;
-    const effectiveSLDist = distToSL + (totalFrictionRate * 100);
+    const effectiveSLDist = (effectiveRiskPerContract / entryPrice) * 100;
     const distToLiq = (Math.abs(entryPrice - liquidationPrice) / entryPrice) * 100;
     const safetyBuffer = distToLiq / distToSL;
 
@@ -1326,13 +1335,17 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, t
     
     // 1. Net PnL at Stop Loss (Exactly -riskAmount when conservative sizing is used)
     const priceLoss = Math.abs(pnlAtSL);
-    const frictionCost = notionalValue * totalFrictionRate;
+    const frictionCost = (effectiveRiskPerContract - priceDiff) * quantity;
     const netPnlAtSL = - (priceLoss + frictionCost);
     
     // 2. Net PnL at Take Profit (Realistic estimate)
     const priceProfit = Math.abs(pnlAtTP);
-    const tpFrictionRate = entryFeeRate + tpFeeRate + (slippageRate * 0.5); // 50% slippage at TP for conservative estimate
-    const totalTpFriction = takeProfit ? (notionalValue * (tpFrictionRate + fundingRateTotal)) : 0;
+    const entryFeePerUnitTP = entryPrice * entryFeeRate;
+    const exitFeePerUnitTP = takeProfit ? takeProfit * tpFeeRate : 0;
+    const slippagePerUnitTP = entryPrice * (slippageRate * 0.5); // 50% slippage at TP for conservative estimate
+    const fundingPerUnitTP = entryPrice * fundingRateTotal;
+    
+    const totalTpFriction = takeProfit ? (quantity * (entryFeePerUnitTP + exitFeePerUnitTP + slippagePerUnitTP + fundingPerUnitTP)) : 0;
     const netPnlAtTP = takeProfit ? (priceProfit - totalTpFriction) : 0;
     
     const estimatedTotalFees = frictionCost; // For summary display
@@ -1438,7 +1451,7 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, t
       riskAmount,
       quantity,
       effectiveSLDist,
-      totalFrictionRate,
+      totalFrictionRate: effectiveFrictionRate,
       notionalValue,
       initialMargin,
       maintenanceMargin,
@@ -2452,7 +2465,8 @@ const LogTradeModal = ({ results, symbol, direction, leverage, entryPrice, stopL
       entryImage1h: entryImage1h || undefined,
       // Real Binance matching update – April 2026
       entryOrderType: results.entryOrderType || 'TAKER',
-      exitOrderType: results.exitOrderType || 'TAKER',
+      exitTpOrderType: results.exitTpOrderType || 'TAKER',
+      exitSlOrderType: results.exitSlOrderType || 'TAKER',
       estimatedHoldHours: results.estimatedHoldHours || 24,
       fundingRatePerInterval: results.fundingRatePerInterval || 0.01,
       fundingIntervalHours: results.fundingIntervalHours || 8,
