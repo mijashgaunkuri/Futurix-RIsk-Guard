@@ -1,32 +1,62 @@
 @import "tailwindcss";
 
 @theme {
-  --color-zinc-950: #09090b;
+  --color-zinc-950: var(--bg-main);
+  --color-zinc-900: var(--bg-card);
+  --color-zinc-800: var(--border-color);
+  --color-zinc-100: var(--text-main);
+  --color-zinc-400: var(--text-muted);
+  --color-zinc-600: var(--text-dim);
+  
   --color-emerald-500: #10b981;
   --color-rose-500: #f43f5e;
   --color-amber-500: #f59e0b;
   --color-blue-500: #3b82f6;
 }
 
+:root {
+  --bg-main: #09090b;
+  --bg-card: #18181b;
+  --border-color: #27272a;
+  --text-main: #f4f4f5;
+  --text-muted: #a1a1aa;
+  --text-dim: #52525b;
+  --input-bg: #09090b;
+}
+
+[data-theme='light'] {
+  --bg-main: #f8fafc;
+  --bg-card: #ffffff;
+  --border-color: #e2e8f0;
+  --text-main: #0f172a;
+  --text-muted: #475569;
+  --text-dim: #94a3b8;
+  --input-bg: #ffffff;
+}
+
 @layer base {
   body {
-    @apply bg-zinc-950 text-zinc-100 antialiased;
+    @apply bg-zinc-950 text-zinc-100 antialiased transition-colors duration-200;
   }
 }
 
 .crypto-card {
-  @apply bg-zinc-900/50 border border-zinc-800 rounded-xl p-4 backdrop-blur-sm;
+  @apply bg-zinc-900/50 border border-zinc-800 rounded-xl p-4 backdrop-blur-sm shadow-sm;
 }
 
 .input-field {
   @apply bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-2 text-zinc-100 focus:outline-none focus:ring-2 focus:ring-emerald-500/50 transition-all;
 }
 
+[data-theme='light'] .input-field {
+  background-color: var(--input-bg);
+}
+
 .btn-primary {
-  @apply bg-emerald-600 hover:bg-emerald-500 text-white font-medium py-2 px-4 rounded-lg transition-colors flex items-center justify-center gap-2;
+  @apply bg-emerald-600 hover:bg-emerald-500 text-white font-medium py-2 px-4 rounded-lg transition-colors flex items-center justify-center gap-2 shadow-md;
 }
 
 .btn-secondary {
-  @apply bg-zinc-800 hover:bg-zinc-700 text-zinc-100 font-medium py-2 px-4 rounded-lg transition-colors flex items-center justify-center gap-2;
+  @apply bg-zinc-800 hover:bg-zinc-700 text-zinc-100 font-medium py-2 px-4 rounded-lg transition-colors flex items-center justify-center gap-2 shadow-sm;
 }
 

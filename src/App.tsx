@@ -23,6 +23,7 @@ import {
   Info, 
   ChevronRight, 
   ChevronDown,
+  ChevronUp,
   ArrowUpDown,
   Eye,
   Edit3,
@@ -365,6 +366,14 @@ const calculateTradeMetrics = (trade: Partial<Trade> & {
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<'calculator' | 'journal' | 'stats' | 'settings'>('calculator');
+  const [theme, setTheme] = useState<'dark' | 'light'>(() => {
+    const saved = localStorage.getItem('app_theme');
+    return (saved as 'dark' | 'light') || 'dark';
+  });
+  const [calculationHistory, setCalculationHistory] = useState<any[]>(() => {
+    const saved = localStorage.getItem('calculation_history');
+    return saved ? JSON.parse(saved) : [];
+  });
   const [trades, setTrades] = useState<Trade[]>([]);
   const [balanceHistory, setBalanceHistory] = useState<BalanceHistory[]>([]);
   const [currentBalance, setCurrentBalance] = useState<number>(0);
@@ -372,6 +381,17 @@ export default function App() {
   const [nprRate, setNprRate] = useState<number>(134); // Fallback rate
   const [user, setUser] = useState<FirebaseUser | null>(null);
   const [isAuthReady, setIsAuthReady] = useState(false);
+
+  // Theme effect
+  useEffect(() => {
+    document.documentElement.setAttribute('data-theme', theme);
+    localStorage.setItem('app_theme', theme);
+  }, [theme]);
+
+  // Calculation history persistence
+  useEffect(() => {
+    localStorage.setItem('calculation_history', JSON.stringify(calculationHistory));
+  }, [calculationHistory]);
 
   // Test Firestore connection
   useEffect(() => {
@@ -878,6 +898,13 @@ export default function App() {
             <div className="w-px h-8 bg-zinc-800 hidden md:block" />
             
             <div className="flex items-center gap-2">
+              <button 
+                onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
+                className="p-2 text-zinc-400 hover:text-emerald-500 transition-colors"
+                title={theme === 'dark' ? "Switch to Light Mode" : "Switch to Dark Mode"}
+              >
+                {theme === 'dark' ? <Zap className="w-5 h-5" /> : <Clock className="w-5 h-5" />}
+              </button>
               <img 
                 src={user.photoURL || `https://ui-avatars.com/api/?name=${user.displayName}`} 
                 alt="Profile" 
@@ -965,6 +992,8 @@ export default function App() {
             onUpdateBalance={updateBalance}
             nprRate={nprRate}
             trades={trades}
+            calculationHistory={calculationHistory}
+            setCalculationHistory={setCalculationHistory}
           />
         )}
         {activeTab === 'journal' && (
@@ -1032,7 +1061,15 @@ export default function App() {
 }
 
 // Placeholder components to be implemented in next steps
-const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, trades }: { currentBalance: number, onLogTrade: (t: Trade) => void, onUpdateBalance: (a: number, t: 'DEPOSIT' | 'WITHDRAWAL' | 'TRADE' | 'RESET', n: string) => void, nprRate: number, trades: Trade[] }) => {
+const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, trades, calculationHistory, setCalculationHistory }: { 
+  currentBalance: number, 
+  onLogTrade: (t: Trade) => void, 
+  onUpdateBalance: (a: number, t: 'DEPOSIT' | 'WITHDRAWAL' | 'TRADE' | 'RESET', n: string) => void, 
+  nprRate: number, 
+  trades: Trade[],
+  calculationHistory: any[],
+  setCalculationHistory: React.Dispatch<React.SetStateAction<any[]>>
+}) => {
   const [direction, setDirection] = useState<TradeDirection>(() => {
     try {
       const saved = localStorage.getItem('calculator_trade_params');
@@ -1096,7 +1133,43 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, t
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [isScanning, setIsScanning] = useState(false);
   const [scanError, setScanError] = useState<string | null>(null);
+  const [expandedHistoryId, setExpandedHistoryId] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const saveToHistory = () => {
+    if (!results) return;
+    const newEntry = {
+      id: crypto.randomUUID(),
+      date: new Date().toISOString(),
+      symbol,
+      direction,
+      entryPrice,
+      stopLoss,
+      takeProfit,
+      leverage,
+      riskPercent,
+      marginMode,
+      useConservativeSizing,
+      results: { ...results }
+    };
+    setCalculationHistory(prev => [newEntry, ...prev].slice(0, 50)); // Keep last 50
+  };
+
+  const deleteHistoryItem = (id: string) => {
+    setCalculationHistory(prev => prev.filter(item => item.id !== id));
+  };
+
+  const loadHistoryItem = (item: any) => {
+    setSymbol(item.symbol);
+    setDirection(item.direction);
+    setEntryPrice(item.entryPrice);
+    setStopLoss(item.stopLoss);
+    setTakeProfit(item.takeProfit || 0);
+    if (item.leverage) setLeverage(item.leverage);
+    if (item.riskPercent) setRiskPercent(item.riskPercent);
+    if (item.marginMode) setMarginMode(item.marginMode);
+    if (item.useConservativeSizing !== undefined) setUseConservativeSizing(item.useConservativeSizing);
+  };
 
   const handleScanScreenshot = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -1936,14 +2009,142 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, t
               </div>
             </div>
 
-            <button 
-              onClick={() => setIsModalOpen(true)}
-              disabled={!results || !results.canTakeTrade}
-              className="btn-primary w-full mt-4 disabled:opacity-50 disabled:cursor-not-allowed"
-            >
-              <Plus className="w-5 h-5" />
-              Log Trade to Journal
-            </button>
+            <div className="grid grid-cols-2 gap-4 mt-6">
+              <button 
+                onClick={() => setIsModalOpen(true)}
+                disabled={!results || !results.canTakeTrade}
+                className="btn-primary w-full disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                <Plus className="w-5 h-5" />
+                Log Trade
+              </button>
+              <button 
+                onClick={saveToHistory}
+                disabled={!results}
+                className="btn-secondary w-full disabled:opacity-50 disabled:cursor-not-allowed border-zinc-800 hover:border-emerald-500/50"
+              >
+                <PlusCircle className="w-5 h-5" />
+                Save to History
+              </button>
+            </div>
+
+            {/* Calculation History Section */}
+            <div className="crypto-card mt-6 border-zinc-800/30 bg-zinc-900/10">
+              <div className="flex items-center justify-between mb-4">
+                <h3 className="text-xs font-bold flex items-center gap-2 uppercase tracking-wider text-zinc-400">
+                  <History className="w-4 h-4 text-emerald-500" />
+                  Calculation History
+                </h3>
+                {calculationHistory.length > 0 && (
+                  <button 
+                    onClick={() => setCalculationHistory([])}
+                    className="text-[10px] text-zinc-600 hover:text-rose-500 uppercase font-bold"
+                  >
+                    Clear
+                  </button>
+                )}
+              </div>
+              
+              {calculationHistory.length > 0 ? (
+                <div className="space-y-2 max-h-[500px] overflow-y-auto pr-2 custom-scrollbar">
+                  {calculationHistory.map((item) => (
+                    <div 
+                      key={item.id}
+                      className="bg-zinc-950/50 border border-zinc-800/50 rounded-xl overflow-hidden group hover:border-emerald-500/30 transition-all"
+                    >
+                      <div 
+                        className="p-3 flex items-center justify-between cursor-pointer"
+                        onClick={() => loadHistoryItem(item)}
+                      >
+                        <div className="flex items-center gap-3 flex-1">
+                          <div className={cn("w-1 h-8 rounded-full", item.direction === 'LONG' ? "bg-emerald-500" : "bg-rose-500")} />
+                          <div>
+                            <div className="flex items-center gap-2">
+                              <span className="text-xs font-bold text-zinc-100">{item.symbol}</span>
+                              <span className={cn("text-[8px] font-bold px-1 rounded", item.direction === 'LONG' ? "bg-emerald-500/10 text-emerald-500" : "bg-rose-500/10 text-rose-500")}>
+                                {item.direction}
+                              </span>
+                            </div>
+                            <div className="text-[10px] text-zinc-500 font-mono">
+                              EP: ${item.entryPrice.toLocaleString()} | Risk: ${item.results?.riskAmount?.toFixed(1) || item.riskAmount?.toFixed(1)} | Profit: ${item.results?.netPnlAtTP?.toFixed(1) || '0.0'}
+                            </div>
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <button 
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setExpandedHistoryId(expandedHistoryId === item.id ? null : item.id);
+                            }}
+                            className="p-1 text-zinc-600 hover:text-emerald-500 transition-colors"
+                          >
+                            {expandedHistoryId === item.id ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+                          </button>
+                          <button 
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              deleteHistoryItem(item.id);
+                            }}
+                            className="p-1.5 text-zinc-600 hover:text-rose-500 opacity-0 group-hover:opacity-100 transition-all"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      </div>
+                      
+                      {expandedHistoryId === item.id && item.results && (
+                        <div className="px-3 pb-3 pt-1 border-t border-zinc-800/50 bg-zinc-900/20">
+                          <div className="grid grid-cols-2 gap-2 mt-2">
+                            <div className="p-2 rounded bg-zinc-950/50 border border-zinc-800/30">
+                              <span className="text-[7px] text-zinc-500 uppercase block">Liq. Price</span>
+                              <span className="text-[10px] font-mono font-bold text-rose-400">${item.results.liquidationPrice.toLocaleString()}</span>
+                            </div>
+                            <div className="p-2 rounded bg-zinc-950/50 border border-zinc-800/30">
+                              <span className="text-[7px] text-zinc-500 uppercase block">Quantity</span>
+                              <span className="text-[10px] font-mono font-bold text-zinc-300">{item.results.quantity.toFixed(4)}</span>
+                            </div>
+                            <div className="p-2 rounded bg-zinc-950/50 border border-zinc-800/30">
+                              <span className="text-[7px] text-zinc-500 uppercase block">Margin</span>
+                              <span className="text-[10px] font-mono font-bold text-zinc-300">${item.results.initialMargin.toFixed(2)}</span>
+                            </div>
+                            <div className="p-2 rounded bg-zinc-950/50 border border-zinc-800/30">
+                              <span className="text-[7px] text-zinc-500 uppercase block">Notional</span>
+                              <span className="text-[10px] font-mono font-bold text-zinc-300">${item.results.notionalValue.toFixed(2)}</span>
+                            </div>
+                            <div className="p-2 rounded bg-zinc-950/50 border border-zinc-800/30">
+                              <span className="text-[7px] text-zinc-500 uppercase block">Planned RR</span>
+                              <span className="text-[10px] font-mono font-bold text-emerald-500">{item.results.plannedRR.toFixed(2)}:1</span>
+                            </div>
+                            <div className="p-2 rounded bg-zinc-950/50 border border-zinc-800/30">
+                              <span className="text-[7px] text-zinc-500 uppercase block">Net RR</span>
+                              <span className="text-[10px] font-mono font-bold text-emerald-500">{item.results.netRR.toFixed(2)}:1</span>
+                            </div>
+                            <div className="p-2 rounded bg-zinc-950/50 border border-zinc-800/30">
+                              <span className="text-[7px] text-zinc-500 uppercase block">Potential Profit</span>
+                              <span className="text-[10px] font-mono font-bold text-emerald-500">${item.results.netPnlAtTP.toFixed(2)}</span>
+                            </div>
+                            <div className="p-2 rounded bg-zinc-950/50 border border-zinc-800/30">
+                              <span className="text-[7px] text-zinc-500 uppercase block">Score</span>
+                              <span className="text-[10px] font-mono font-bold text-amber-500">{item.results.qualityScore}/10</span>
+                            </div>
+                          </div>
+                          <div className="mt-2 text-[8px] text-zinc-600 flex justify-between items-center">
+                            <span>{format(new Date(item.date), 'MMM d, HH:mm:ss')}</span>
+                            <span className="uppercase tracking-widest">{item.marginMode} • {item.leverage}x</span>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="py-8 text-center border-2 border-dashed border-zinc-800/50 rounded-xl">
+                  <History className="w-8 h-8 mx-auto mb-2 text-zinc-800" />
+                  <p className="text-[10px] text-zinc-600 uppercase font-bold">No history yet</p>
+                  <p className="text-[8px] text-zinc-700 mt-1">Calculations you save will appear here</p>
+                </div>
+              )}
+            </div>
           </div>
         </div>
       </div>
@@ -2283,15 +2484,24 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, t
                     <p className="text-[10px] text-zinc-500 uppercase tracking-tighter">10-Point Risk & Strategy Validation</p>
                   </div>
                 </div>
-                <div className="flex items-baseline gap-1">
-                  <span className={cn(
-                    "text-3xl font-black font-mono",
-                    results.qualityScore >= 8 ? "text-emerald-500" :
-                    results.qualityScore >= 6 ? "text-amber-500" : "text-rose-500"
-                  )}>
-                    {results.qualityScore}
-                  </span>
-                  <span className="text-zinc-600 font-bold">/10</span>
+                <div className="flex items-center gap-4">
+                  <button 
+                    onClick={saveToHistory}
+                    className="p-2 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-400 hover:text-emerald-500 transition-all"
+                    title="Save to History"
+                  >
+                    <PlusCircle className="w-5 h-5" />
+                  </button>
+                  <div className="flex items-baseline gap-1">
+                    <span className={cn(
+                      "text-3xl font-black font-mono",
+                      results.qualityScore >= 8 ? "text-emerald-500" :
+                      results.qualityScore >= 6 ? "text-amber-500" : "text-rose-500"
+                    )}>
+                      {results.qualityScore}
+                    </span>
+                    <span className="text-zinc-600 font-bold">/10</span>
+                  </div>
                 </div>
               </div>
 
@@ -2342,6 +2552,29 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, t
                       {results.rules.find((r: any) => !r.passed && r.id === 3) && " Priority: Your liquidation price is too close to your stop loss. This is a critical risk."}
                     </p>
                   </div>
+                </div>
+              </div>
+            </div>
+
+            {/* Suggested Take Profit Targets */}
+            <div className="crypto-card border-zinc-800/50 bg-zinc-900/30 mt-6">
+              <div className="flex items-center gap-2 mb-4">
+                <div className="p-2 rounded-lg bg-blue-500/10">
+                  <Target className="w-5 h-5 text-blue-500" />
+                </div>
+                <div>
+                  <h3 className="text-base font-bold text-zinc-100">Suggested TP Targets</h3>
+                  <p className="text-[10px] text-zinc-500 uppercase tracking-tighter">Based on Risk Multiples</p>
+                </div>
+              </div>
+              <div className="grid grid-cols-2 gap-4">
+                <div className="p-4 bg-zinc-950/50 rounded-xl border border-zinc-800/50 flex flex-col items-center justify-center">
+                  <span className="text-[10px] font-bold text-zinc-500 uppercase mb-1">TP 2 (2:1 RR)</span>
+                  <span className="text-xl font-black font-mono text-emerald-500">${results.suggestedTP2.toLocaleString()}</span>
+                </div>
+                <div className="p-4 bg-zinc-950/50 rounded-xl border border-zinc-800/50 flex flex-col items-center justify-center">
+                  <span className="text-[10px] font-bold text-zinc-500 uppercase mb-1">TP 3 (3:1 RR)</span>
+                  <span className="text-xl font-black font-mono text-emerald-500">${results.suggestedTP3.toLocaleString()}</span>
                 </div>
               </div>
             </div>
@@ -3633,6 +3866,29 @@ const JournalTab = ({
     const avgLoss = losses.length > 0 ? Math.abs(losses.reduce((acc, t) => acc + t.netPnl, 0)) / losses.length : 0;
     const expectancy = (winRate / 100 * avgWin) - ((1 - winRate / 100) * avgLoss);
 
+    // Drawdown Calculation
+    let maxDrawdown = 0;
+    let maxDrawdownPercent = 0;
+    let currentDrawdown = 0;
+    let currentDrawdownPercent = 0;
+    let peak = startingBalance;
+    
+    const sortedHistory = [...balanceHistory].sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
+    
+    sortedHistory.forEach((h) => {
+      if (h.balanceAfter > peak) {
+        peak = h.balanceAfter;
+      }
+      const dd = peak - h.balanceAfter;
+      const ddPct = peak > 0 ? (dd / peak) * 100 : 0;
+      
+      if (dd > maxDrawdown) maxDrawdown = dd;
+      if (ddPct > maxDrawdownPercent) maxDrawdownPercent = ddPct;
+      
+      currentDrawdown = dd;
+      currentDrawdownPercent = ddPct;
+    });
+
     // Daily Heatmap (last 60 days)
     const heatmapData = [];
     const now = new Date();
@@ -3667,9 +3923,13 @@ const JournalTab = ({
       avgDuration,
       expectancy,
       avgWin,
-      avgLoss
+      avgLoss,
+      maxDrawdown,
+      maxDrawdownPercent,
+      currentDrawdown,
+      currentDrawdownPercent
     };
-  }, [trades]);
+  }, [trades, balanceHistory, startingBalance]);
 
   const filteredTrades = useMemo(() => {
     const filtered = trades.filter((t: Trade) => {
@@ -3882,9 +4142,10 @@ const JournalTab = ({
 
   const formatTradeDuration = (minutes?: number) => {
     if (!minutes) return '—';
-    if (minutes < 60) return `${minutes}m`;
-    const hours = Math.floor(minutes / 60);
-    const remainingMinutes = minutes % 60;
+    const roundedMinutes = Math.round(minutes);
+    if (roundedMinutes < 60) return `${roundedMinutes}m`;
+    const hours = Math.floor(roundedMinutes / 60);
+    const remainingMinutes = roundedMinutes % 60;
     if (hours < 24) return `${hours}h ${remainingMinutes}m`;
     const days = Math.floor(hours / 24);
     const remainingHours = hours % 24;
@@ -3937,6 +4198,21 @@ const JournalTab = ({
               {dashboardStats.profitFactor === Infinity ? '∞' : dashboardStats.profitFactor.toFixed(2)}
             </div>
             <div className="text-[10px] text-zinc-500 mt-1">Expectancy: ${dashboardStats.expectancy.toFixed(2)}</div>
+          </div>
+
+          <div className="crypto-card bg-zinc-900/50 border-zinc-800/50">
+            <div className="flex items-center gap-2 mb-2">
+              <div className="p-1.5 rounded-lg bg-rose-500/10">
+                <ArrowDownRight className="w-4 h-4 text-rose-500" />
+              </div>
+              <span className="text-[10px] text-zinc-500 uppercase font-bold">Max Drawdown</span>
+            </div>
+            <div className="text-2xl font-mono font-bold text-rose-500">
+              {dashboardStats.maxDrawdownPercent.toFixed(1)}%
+            </div>
+            <div className="text-[10px] text-zinc-500 mt-1">
+              Current: {dashboardStats.currentDrawdownPercent.toFixed(1)}%
+            </div>
           </div>
 
           <div className="crypto-card bg-zinc-900/50 border-zinc-800/50">
@@ -5175,6 +5451,36 @@ const StatsTab = ({ trades, startingBalance, balanceHistory }: any) => {
 
     const monthlyData = Object.entries(monthlyPnl).map(([name, pnl]) => ({ name, pnl }));
 
+    // Drawdown Calculation
+    let maxDrawdown = 0;
+    let maxDrawdownPercent = 0;
+    let currentDrawdown = 0;
+    let currentDrawdownPercent = 0;
+    let peak = startingBalance;
+    
+    const sortedHistory = [...balanceHistory].sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
+    const drawdownData: any[] = [];
+    
+    sortedHistory.forEach((h) => {
+      if (h.balanceAfter > peak) {
+        peak = h.balanceAfter;
+      }
+      const dd = peak - h.balanceAfter;
+      const ddPct = peak > 0 ? (dd / peak) * 100 : 0;
+      
+      if (dd > maxDrawdown) maxDrawdown = dd;
+      if (ddPct > maxDrawdownPercent) maxDrawdownPercent = ddPct;
+      
+      currentDrawdown = dd;
+      currentDrawdownPercent = ddPct;
+
+      drawdownData.push({
+        date: format(new Date(h.date), 'MMM dd HH:mm'),
+        drawdown: parseFloat(ddPct.toFixed(2)),
+        amount: parseFloat(dd.toFixed(2))
+      });
+    });
+
     // Equity Curve (using balance history for accuracy)
     const equityData = [...balanceHistory]
       .sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime())
@@ -5202,6 +5508,11 @@ const StatsTab = ({ trades, startingBalance, balanceHistory }: any) => {
       totalFundingFees,
       monthlyData,
       equityData,
+      drawdownData,
+      maxDrawdown,
+      maxDrawdownPercent,
+      currentDrawdown,
+      currentDrawdownPercent,
       totalTrades: closed.length
     };
   }, [trades, startingBalance, balanceHistory]);
@@ -5240,6 +5551,11 @@ const StatsTab = ({ trades, startingBalance, balanceHistory }: any) => {
           <span className="text-[10px] text-zinc-500 uppercase font-bold tracking-wider">Avg Efficiency</span>
           <div className="text-2xl font-mono font-bold text-amber-500 mt-1">{stats.avgEfficiency.toFixed(1)}%</div>
           <div className="text-[10px] text-zinc-500 mt-1">MFE: {stats.avgMfe.toFixed(1)}% | MAE: {stats.avgMae.toFixed(1)}%</div>
+        </div>
+        <div className="crypto-card">
+          <span className="text-[10px] text-zinc-500 uppercase font-bold tracking-wider">Max Drawdown</span>
+          <div className="text-2xl font-mono font-bold text-rose-500 mt-1">{stats.maxDrawdownPercent.toFixed(1)}%</div>
+          <div className="text-[10px] text-zinc-500 mt-1">Current: {stats.currentDrawdownPercent.toFixed(1)}%</div>
         </div>
         <div className="crypto-card">
           <span className="text-[10px] text-zinc-500 uppercase font-bold tracking-wider">Total Funding</span>
@@ -5317,29 +5633,73 @@ const StatsTab = ({ trades, startingBalance, balanceHistory }: any) => {
         </div>
       </div>
 
-      {/* Strategy Performance */}
-      <div className="crypto-card p-6">
-        <h3 className="text-sm font-bold uppercase text-zinc-500 mb-6">Win Rate by Strategy</h3>
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-          {Object.entries(stats.strategyStats).map(([name, data]: [string, any]) => {
-            const wr = (data.wins / data.total) * 100;
-            return (
-              <div key={name} className="p-4 bg-zinc-950 rounded-xl border border-zinc-800">
-                <div className="flex justify-between items-center mb-2">
-                  <span className="text-xs font-bold text-zinc-200">{name}</span>
-                  <span className={cn("text-xs font-bold", wr >= 50 ? "text-emerald-500" : "text-rose-500")}>
-                    {wr.toFixed(1)}%
-                  </span>
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        {/* Drawdown Chart */}
+        <div className="crypto-card p-6">
+          <h3 className="text-sm font-bold uppercase text-zinc-500 mb-6 flex items-center gap-2">
+            <ArrowDownRight className="w-4 h-4 text-rose-500" /> Drawdown Analysis (%)
+          </h3>
+          <div className="h-[300px] w-full">
+            <ResponsiveContainer width="100%" height="100%">
+              <AreaChart data={stats.drawdownData}>
+                <defs>
+                  <linearGradient id="colorDrawdown" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="5%" stopColor="#f43f5e" stopOpacity={0.3}/>
+                    <stop offset="95%" stopColor="#f43f5e" stopOpacity={0}/>
+                  </linearGradient>
+                </defs>
+                <CartesianGrid strokeDasharray="3 3" stroke="#27272a" vertical={false} />
+                <XAxis 
+                  dataKey="date" 
+                  stroke="#71717a" 
+                  fontSize={10} 
+                  tickLine={false} 
+                  axisLine={false}
+                  hide={stats.drawdownData.length > 15}
+                />
+                <YAxis 
+                  stroke="#71717a" 
+                  fontSize={10} 
+                  tickLine={false} 
+                  axisLine={false} 
+                  tickFormatter={(val) => `${val}%`}
+                  reversed
+                />
+                <RechartsTooltip 
+                  contentStyle={{ backgroundColor: '#18181b', border: '1px solid #27272a', borderRadius: '8px' }}
+                  itemStyle={{ color: '#f43f5e' }}
+                  formatter={(value: number) => [`${value.toFixed(2)}%`, 'Drawdown']}
+                />
+                <Area type="monotone" dataKey="drawdown" stroke="#f43f5e" fillOpacity={1} fill="url(#colorDrawdown)" strokeWidth={2} />
+              </AreaChart>
+            </ResponsiveContainer>
+          </div>
+        </div>
+
+        {/* Strategy Performance */}
+        <div className="crypto-card p-6">
+          <h3 className="text-sm font-bold uppercase text-zinc-500 mb-6">Win Rate by Strategy</h3>
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+            {Object.entries(stats.strategyStats).map(([name, data]: [string, any]) => {
+              const wr = (data.wins / data.total) * 100;
+              return (
+                <div key={name} className="p-4 bg-zinc-950 rounded-xl border border-zinc-800">
+                  <div className="flex justify-between items-center mb-2">
+                    <span className="text-xs font-bold text-zinc-200">{name}</span>
+                    <span className={cn("text-xs font-bold", wr >= 50 ? "text-emerald-500" : "text-rose-500")}>
+                      {wr.toFixed(1)}%
+                    </span>
+                  </div>
+                  <div className="h-1.5 bg-zinc-900 rounded-full overflow-hidden">
+                    <div className="h-full bg-emerald-500" style={{ width: `${wr}%` }} />
+                  </div>
+                  <div className="mt-2 text-[10px] text-zinc-500">
+                    {data.wins} wins / {data.total} total
+                  </div>
                 </div>
-                <div className="h-1.5 bg-zinc-900 rounded-full overflow-hidden">
-                  <div className="h-full bg-emerald-500" style={{ width: `${wr}%` }} />
-                </div>
-                <div className="mt-2 text-[10px] text-zinc-500">
-                  {data.wins} wins / {data.total} total
-                </div>
-              </div>
-            );
-          })}
+              );
+            })}
+          </div>
         </div>
       </div>
 
