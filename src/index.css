@@ -1,12 +1,17 @@
 @import "tailwindcss";
 
 @theme {
-  --color-zinc-950: var(--bg-main);
-  --color-zinc-900: var(--bg-card);
-  --color-zinc-800: var(--border-color);
+  --color-zinc-50: var(--text-bright);
   --color-zinc-100: var(--text-main);
-  --color-zinc-400: var(--text-muted);
-  --color-zinc-600: var(--text-dim);
+  --color-zinc-200: var(--text-muted);
+  --color-zinc-300: var(--text-muted-more);
+  --color-zinc-400: var(--text-muted-even-more);
+  --color-zinc-500: var(--text-dim);
+  --color-zinc-600: var(--text-dim-more);
+  --color-zinc-700: var(--border-color-dim);
+  --color-zinc-800: var(--border-color);
+  --color-zinc-900: var(--bg-card);
+  --color-zinc-950: var(--bg-main);
   
   --color-emerald-500: #10b981;
   --color-rose-500: #f43f5e;
@@ -18,9 +23,14 @@
   --bg-main: #09090b;
   --bg-card: #18181b;
   --border-color: #27272a;
+  --border-color-dim: #3f3f46;
+  --text-bright: #fafafa;
   --text-main: #f4f4f5;
-  --text-muted: #a1a1aa;
-  --text-dim: #52525b;
+  --text-muted: #e4e4e7;
+  --text-muted-more: #d4d4d8;
+  --text-muted-even-more: #a1a1aa;
+  --text-dim: #71717a;
+  --text-dim-more: #52525b;
   --input-bg: #09090b;
 }
 
@@ -28,9 +38,14 @@
   --bg-main: #f8fafc;
   --bg-card: #ffffff;
   --border-color: #e2e8f0;
+  --border-color-dim: #cbd5e1;
+  --text-bright: #020617;
   --text-main: #0f172a;
-  --text-muted: #475569;
-  --text-dim: #94a3b8;
+  --text-muted: #334155;
+  --text-muted-more: #475569;
+  --text-muted-even-more: #64748b;
+  --text-dim: #64748b;
+  --text-dim-more: #94a3b8;
   --input-bg: #ffffff;
 }
 

@@ -48,7 +48,8 @@ import {
   ShieldCheck,
   Brain,
   FileText,
-  PlusCircle
+  PlusCircle,
+  X
 } from 'lucide-react';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
@@ -381,6 +382,10 @@ export default function App() {
   const [nprRate, setNprRate] = useState<number>(134); // Fallback rate
   const [user, setUser] = useState<FirebaseUser | null>(null);
   const [isAuthReady, setIsAuthReady] = useState(false);
+  const [dailyGoals, setDailyGoals] = useState({
+    maxTradesPerDay: 4,
+    maxConsecutiveLosses: 2
+  });
 
   // Theme effect
   useEffect(() => {
@@ -450,6 +455,9 @@ export default function App() {
 
         setStartingBalance(sBalance);
         setCurrentBalance(data.currentBalance || 0);
+        if (data.dailyGoals) {
+          setDailyGoals(data.dailyGoals);
+        }
       } else {
         // Create user document if it doesn't exist
         const initialUser = {
@@ -524,6 +532,16 @@ export default function App() {
       .filter(t => t.status === 'OPEN')
       .reduce((sum, t) => sum + t.initialMargin + (t.addedMargin || 0), 0);
   }, [trades]);
+
+  const updateDailyGoals = async (goals: { maxTradesPerDay: number, maxConsecutiveLosses: number }) => {
+    if (!user) return;
+    try {
+      setDailyGoals(goals);
+      await setDoc(doc(db, 'users', user.uid), { dailyGoals: goals }, { merge: true });
+    } catch (error) {
+      handleFirestoreError(error, OperationType.UPDATE, `users/${user.uid}`);
+    }
+  };
 
   const updateBalance = async (amount: number, type: 'DEPOSIT' | 'WITHDRAWAL' | 'TRADE' | 'RESET', note: string = '') => {
     if (!user) return;
@@ -1014,6 +1032,7 @@ export default function App() {
             importBinanceCSV={importBinanceCSV}
             clearData={clearData}
             setActiveTab={setActiveTab}
+            dailyGoals={dailyGoals}
           />
         )}
         {activeTab === 'stats' && (
@@ -1021,6 +1040,8 @@ export default function App() {
             trades={trades} 
             balanceHistory={balanceHistory}
             startingBalance={startingBalance}
+            dailyGoals={dailyGoals}
+            onUpdateDailyGoals={updateDailyGoals}
           />
         )}
       </main>
@@ -3820,7 +3841,8 @@ const JournalTab = ({
   importData, 
   importBinanceCSV,
   clearData,
-  setActiveTab
+  setActiveTab,
+  dailyGoals
 }: any) => {
   const [search, setSearch] = useState('');
   const [filterDirection, setFilterDirection] = useState<string>('ALL');
@@ -3829,6 +3851,7 @@ const JournalTab = ({
   const [newBalanceValue, setNewBalanceValue] = useState(currentBalance);
   const [balanceNote, setBalanceNote] = useState('');
   const [reviewTrade, setReviewTrade] = useState<Trade | null>(null);
+  const [fullScreenImage, setFullScreenImage] = useState<string | null>(null);
   const [closingTrade, setClosingTrade] = useState<Trade | null>(null);
   const [editingPnlTrade, setEditingPnlTrade] = useState<Trade | null>(null);
   const [addingMarginTrade, setAddingMarginTrade] = useState<Trade | null>(null);
@@ -3908,6 +3931,28 @@ const JournalTab = ({
       heatmapData.push({ date: dateStr, pnl: dayPnl, status });
     }
 
+    // Daily stats
+    const today = new Date();
+    const todayStr = format(today, 'yyyy-MM-dd');
+    const tradesToday = trades.filter(t => format(new Date(t.date), 'yyyy-MM-dd') === todayStr);
+    const closedToday = tradesToday.filter(t => t.status === 'CLOSED');
+    
+    // Consecutive losses today
+    let maxConsecutiveLossesToday = 0;
+    let currentConsecutiveLossesToday = 0;
+    const sortedClosedToday = [...closedToday].sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
+    
+    sortedClosedToday.forEach(t => {
+      if (t.netPnl <= 0) {
+        currentConsecutiveLossesToday++;
+        if (currentConsecutiveLossesToday > maxConsecutiveLossesToday) {
+          maxConsecutiveLossesToday = currentConsecutiveLossesToday;
+        }
+      } else {
+        currentConsecutiveLossesToday = 0;
+      }
+    });
+
     return {
       total: trades.length,
       closed: closed.length,
@@ -3927,7 +3972,9 @@ const JournalTab = ({
       maxDrawdown,
       maxDrawdownPercent,
       currentDrawdown,
-      currentDrawdownPercent
+      currentDrawdownPercent,
+      tradesTodayCount: tradesToday.length,
+      consecutiveLossesToday: maxConsecutiveLossesToday
     };
   }, [trades, balanceHistory, startingBalance]);
 
@@ -4248,6 +4295,81 @@ const JournalTab = ({
         </div>
       </div>
 
+      {/* Daily Discipline Checklist */}
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div className="crypto-card bg-zinc-900/50 border-zinc-800/50">
+          <div className="flex items-center justify-between mb-4">
+            <h3 className="text-xs font-bold text-zinc-400 uppercase tracking-wider flex items-center gap-2">
+              <ShieldCheck className="w-4 h-4 text-emerald-500" />
+              Daily Discipline Checklist
+            </h3>
+            <span className="text-[10px] text-zinc-500 font-mono">{format(new Date(), 'EEEE, MMM dd')}</span>
+          </div>
+          <div className="space-y-3">
+            <div className="flex items-center justify-between p-2 rounded-lg bg-zinc-950/50 border border-zinc-800/50">
+              <div className="flex items-center gap-3">
+                <div className={cn(
+                  "w-5 h-5 rounded-full flex items-center justify-center border transition-colors",
+                  dashboardStats.tradesTodayCount <= dailyGoals.maxTradesPerDay ? "bg-emerald-500/10 border-emerald-500/50 text-emerald-500" : "bg-rose-500/10 border-rose-500/50 text-rose-500"
+                )}>
+                  {dashboardStats.tradesTodayCount <= dailyGoals.maxTradesPerDay ? <CheckCircle2 className="w-3 h-3" /> : <AlertTriangle className="w-3 h-3" />}
+                </div>
+                <span className="text-xs text-zinc-300">Max {dailyGoals.maxTradesPerDay} trades per day</span>
+              </div>
+              <span className={cn("text-xs font-mono font-bold", dashboardStats.tradesTodayCount > dailyGoals.maxTradesPerDay ? "text-rose-500" : "text-zinc-400")}>
+                {dashboardStats.tradesTodayCount}/{dailyGoals.maxTradesPerDay}
+              </span>
+            </div>
+
+            <div className="flex items-center justify-between p-2 rounded-lg bg-zinc-950/50 border border-zinc-800/50">
+              <div className="flex items-center gap-3">
+                <div className={cn(
+                  "w-5 h-5 rounded-full flex items-center justify-center border transition-colors",
+                  dashboardStats.consecutiveLossesToday < dailyGoals.maxConsecutiveLosses ? "bg-emerald-500/10 border-emerald-500/50 text-emerald-500" : "bg-rose-500/10 border-rose-500/50 text-rose-500"
+                )}>
+                  {dashboardStats.consecutiveLossesToday < dailyGoals.maxConsecutiveLosses ? <CheckCircle2 className="w-3 h-3" /> : <AlertTriangle className="w-3 h-3" />}
+                </div>
+                <span className="text-xs text-zinc-300">Stop after {dailyGoals.maxConsecutiveLosses} consecutive losses</span>
+              </div>
+              <span className={cn("text-xs font-mono font-bold", dashboardStats.consecutiveLossesToday >= dailyGoals.maxConsecutiveLosses ? "text-rose-500" : "text-zinc-400")}>
+                {dashboardStats.consecutiveLossesToday}/{dailyGoals.maxConsecutiveLosses}
+              </span>
+            </div>
+
+            <div className="flex items-center justify-between p-2 rounded-lg bg-zinc-950/50 border border-zinc-800/50">
+              <div className="flex items-center gap-3">
+                <div className={cn(
+                  "w-5 h-5 rounded-full flex items-center justify-center border transition-colors",
+                  dashboardStats.netPnl >= 0 ? "bg-emerald-500/10 border-emerald-500/50 text-emerald-500" : "bg-zinc-800 border-zinc-700 text-zinc-600"
+                )}>
+                  <Trophy className="w-3 h-3" />
+                </div>
+                <span className="text-xs text-zinc-300">Daily Profit Goal</span>
+              </div>
+              <span className={cn("text-xs font-mono font-bold", dashboardStats.netPnl > 0 ? "text-emerald-500" : "text-zinc-500")}>
+                {dashboardStats.netPnl > 0 ? 'REACHED' : 'PENDING'}
+              </span>
+            </div>
+          </div>
+        </div>
+
+        <div className="crypto-card bg-zinc-900/50 border-zinc-800/50 flex flex-col justify-center">
+          <div className="text-center space-y-2">
+            <div className="inline-flex p-3 rounded-full bg-emerald-500/10 mb-2">
+              <Brain className="w-6 h-6 text-emerald-500" />
+            </div>
+            <h4 className="text-sm font-bold text-zinc-100">Trading Psychology Status</h4>
+            <p className="text-xs text-zinc-500 max-w-[250px] mx-auto">
+              {dashboardStats.consecutiveLossesToday >= dailyGoals.maxConsecutiveLosses 
+                ? "Discipline Alert: You've hit your consecutive loss limit. Step away from the charts to avoid revenge trading."
+                : dashboardStats.tradesTodayCount >= dailyGoals.maxTradesPerDay
+                ? "Daily Limit Reached: You've completed your planned trades for today. Great job sticking to the plan!"
+                : "Market Focus: Stick to your setups and maintain your risk parameters. Quality over quantity."}
+            </p>
+          </div>
+        </div>
+      </div>
+
       {/* Quick Insights Bar */}
       {insights && (
         <div className="flex flex-wrap gap-3">
@@ -4433,16 +4555,28 @@ const JournalTab = ({
                   {reviewTrade.entryImage1h && (
                     <div className="space-y-2">
                       <span className="text-[10px] text-zinc-500 uppercase font-bold">Entry (1h)</span>
-                      <div className="rounded-xl overflow-hidden border border-zinc-800 bg-zinc-950">
-                        <img src={reviewTrade.entryImage1h} alt="Entry 1h" className="w-full h-auto" />
+                      <div 
+                        className="rounded-xl overflow-hidden border border-zinc-800 bg-zinc-950 cursor-pointer hover:border-emerald-500 transition-all group relative"
+                        onClick={() => setFullScreenImage(reviewTrade.entryImage1h)}
+                      >
+                        <img src={reviewTrade.entryImage1h} alt="Entry 1h" className="w-full h-auto" referrerPolicy="no-referrer" />
+                        <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 flex items-center justify-center transition-opacity">
+                          <Eye className="w-6 h-6 text-white" />
+                        </div>
                       </div>
                     </div>
                   )}
                   {reviewTrade.exitImage5min && (
                     <div className="space-y-2">
                       <span className="text-[10px] text-zinc-500 uppercase font-bold">Exit (5min)</span>
-                      <div className="rounded-xl overflow-hidden border border-zinc-800 bg-zinc-950">
-                        <img src={reviewTrade.exitImage5min} alt="Exit 5min" className="w-full h-auto" />
+                      <div 
+                        className="rounded-xl overflow-hidden border border-zinc-800 bg-zinc-950 cursor-pointer hover:border-rose-500 transition-all group relative"
+                        onClick={() => setFullScreenImage(reviewTrade.exitImage5min)}
+                      >
+                        <img src={reviewTrade.exitImage5min} alt="Exit 5min" className="w-full h-auto" referrerPolicy="no-referrer" />
+                        <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 flex items-center justify-center transition-opacity">
+                          <Eye className="w-6 h-6 text-white" />
+                        </div>
                       </div>
                     </div>
                   )}
@@ -4820,7 +4954,7 @@ const JournalTab = ({
                     <div className="flex items-center gap-1.5">
                       {t.entryImage1h && (
                         <div 
-                          onClick={() => setReviewTrade(t)}
+                          onClick={() => setFullScreenImage(t.entryImage1h)}
                           className="w-10 h-7 rounded border border-emerald-500/30 overflow-hidden cursor-pointer hover:border-emerald-500 transition-colors bg-zinc-950"
                           title="View Entry Screenshot"
                         >
@@ -4829,7 +4963,7 @@ const JournalTab = ({
                       )}
                       {t.exitImage5min && (
                         <div 
-                          onClick={() => setReviewTrade(t)}
+                          onClick={() => setFullScreenImage(t.exitImage5min)}
                           className="w-10 h-7 rounded border border-rose-500/30 overflow-hidden cursor-pointer hover:border-rose-500 transition-colors bg-zinc-950"
                           title="View Exit Screenshot"
                         >
@@ -5360,14 +5494,80 @@ const JournalTab = ({
         )}
 
       </div>
+
+      {/* Full Screen Image Modal */}
+      <AnimatePresence>
+        {fullScreenImage && (
+          <motion.div 
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-[100] flex items-center justify-center p-4 md:p-8 bg-black/95 backdrop-blur-sm"
+            onClick={() => setFullScreenImage(null)}
+          >
+            <motion.div 
+              initial={{ scale: 0.9, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.9, opacity: 0 }}
+              className="relative max-w-full max-h-full flex items-center justify-center"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <button 
+                onClick={() => setFullScreenImage(null)}
+                className="absolute -top-12 right-0 p-2 text-white/70 hover:text-white transition-colors bg-white/10 rounded-full backdrop-blur-md"
+              >
+                <X className="w-6 h-6" />
+              </button>
+              <img 
+                src={fullScreenImage} 
+                alt="Full Screen" 
+                className="max-w-full max-h-[85vh] object-contain rounded-xl shadow-2xl border border-white/10"
+                referrerPolicy="no-referrer"
+              />
+              <div className="absolute -bottom-12 left-1/2 -translate-x-1/2 text-white/50 text-xs font-medium">
+                Click anywhere outside to close
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 };
 
-const StatsTab = ({ trades, startingBalance, balanceHistory }: any) => {
+const StatsTab = ({ trades, startingBalance, balanceHistory, dailyGoals, onUpdateDailyGoals }: any) => {
+  const [isEditingGoals, setIsEditingGoals] = useState(false);
+  const [tempGoals, setTempGoals] = useState(dailyGoals);
+
   const stats = useMemo(() => {
     const closed = trades.filter((t: Trade) => t.status === 'CLOSED');
-    if (closed.length === 0) return null;
+    
+    // Daily stats for tracking
+    const today = new Date();
+    const todayStr = format(today, 'yyyy-MM-dd');
+    const tradesToday = trades.filter((t: Trade) => format(new Date(t.date), 'yyyy-MM-dd') === todayStr);
+    const closedToday = tradesToday.filter((t: Trade) => t.status === 'CLOSED');
+    
+    let maxConsecutiveLossesToday = 0;
+    let currentConsecutiveLossesToday = 0;
+    const sortedClosedToday = [...closedToday].sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
+    
+    sortedClosedToday.forEach(t => {
+      if (t.netPnl <= 0) {
+        currentConsecutiveLossesToday++;
+        if (currentConsecutiveLossesToday > maxConsecutiveLossesToday) {
+          maxConsecutiveLossesToday = currentConsecutiveLossesToday;
+        }
+      } else {
+        currentConsecutiveLossesToday = 0;
+      }
+    });
+
+    if (closed.length === 0) return {
+      tradesTodayCount: tradesToday.length,
+      consecutiveLossesToday: maxConsecutiveLossesToday,
+      totalTrades: 0
+    };
 
     const wins = closed.filter((t: Trade) => t.netPnl > 0);
     const losses = closed.filter((t: Trade) => t.netPnl <= 0);
@@ -5513,21 +5713,213 @@ const StatsTab = ({ trades, startingBalance, balanceHistory }: any) => {
       maxDrawdownPercent,
       currentDrawdown,
       currentDrawdownPercent,
-      totalTrades: closed.length
+      totalTrades: closed.length,
+      tradesTodayCount: tradesToday.length,
+      consecutiveLossesToday: maxConsecutiveLossesToday
     };
   }, [trades, startingBalance, balanceHistory]);
 
-  if (!stats) {
+  if (!stats || stats.totalTrades === 0) {
     return (
-      <div className="flex flex-col items-center justify-center py-20 text-zinc-600">
-        <History className="w-12 h-12 mb-4 opacity-20" />
-        <p className="italic">Not enough closed trades to generate analytics.</p>
+      <div className="space-y-8">
+        {/* Risk Management Goals (Always visible) */}
+        <div className="crypto-card p-6">
+          <div className="flex items-center justify-between mb-6">
+            <h3 className="text-sm font-bold uppercase text-zinc-500 flex items-center gap-2">
+              <Shield className="w-4 h-4" /> Daily Risk Management Goals
+            </h3>
+            <button 
+              onClick={() => setIsEditingGoals(!isEditingGoals)}
+              className="text-xs text-emerald-500 hover:text-emerald-400 font-bold"
+            >
+              {isEditingGoals ? 'Cancel' : 'Edit Goals'}
+            </button>
+          </div>
+
+          {isEditingGoals ? (
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+              <div className="space-y-2">
+                <label className="text-[10px] text-zinc-500 uppercase font-bold">Max Trades Per Day</label>
+                <input 
+                  type="number" 
+                  value={tempGoals.maxTradesPerDay}
+                  onChange={(e) => setTempGoals({...tempGoals, maxTradesPerDay: parseInt(e.target.value) || 0})}
+                  className="input-field w-full"
+                />
+              </div>
+              <div className="space-y-2">
+                <label className="text-[10px] text-zinc-500 uppercase font-bold">Max Consecutive Losses</label>
+                <input 
+                  type="number" 
+                  value={tempGoals.maxConsecutiveLosses}
+                  onChange={(e) => setTempGoals({...tempGoals, maxConsecutiveLosses: parseInt(e.target.value) || 0})}
+                  className="input-field w-full"
+                />
+              </div>
+              <button 
+                onClick={() => {
+                  onUpdateDailyGoals(tempGoals);
+                  setIsEditingGoals(false);
+                }}
+                className="btn-primary md:col-span-2"
+              >
+                Save Goals
+              </button>
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+              <div className="p-4 bg-zinc-950 rounded-xl border border-zinc-800">
+                <div className="flex justify-between items-center mb-2">
+                  <span className="text-xs text-zinc-400">Daily Trade Limit</span>
+                  <span className={cn("text-xs font-bold", stats.tradesTodayCount > dailyGoals.maxTradesPerDay ? "text-rose-500" : "text-emerald-500")}>
+                    {stats.tradesTodayCount} / {dailyGoals.maxTradesPerDay}
+                  </span>
+                </div>
+                <div className="h-1.5 bg-zinc-900 rounded-full overflow-hidden">
+                  <div 
+                    className={cn("h-full", stats.tradesTodayCount > dailyGoals.maxTradesPerDay ? "bg-rose-500" : "bg-emerald-500")} 
+                    style={{ width: `${Math.min(100, (stats.tradesTodayCount / dailyGoals.maxTradesPerDay) * 100)}%` }} 
+                  />
+                </div>
+              </div>
+
+              <div className="p-4 bg-zinc-950 rounded-xl border border-zinc-800">
+                <div className="flex justify-between items-center mb-2">
+                  <span className="text-xs text-zinc-400">Consecutive Losses</span>
+                  <span className={cn("text-xs font-bold", stats.consecutiveLossesToday >= dailyGoals.maxConsecutiveLosses ? "text-rose-500" : "text-emerald-500")}>
+                    {stats.consecutiveLossesToday} / {dailyGoals.maxConsecutiveLosses}
+                  </span>
+                </div>
+                <div className="h-1.5 bg-zinc-900 rounded-full overflow-hidden">
+                  <div 
+                    className={cn("h-full", stats.consecutiveLossesToday >= dailyGoals.maxConsecutiveLosses ? "bg-rose-500" : "bg-emerald-500")} 
+                    style={{ width: `${Math.min(100, (stats.consecutiveLossesToday / dailyGoals.maxConsecutiveLosses) * 100)}%` }} 
+                  />
+                </div>
+              </div>
+
+              <div className="p-4 bg-zinc-950 rounded-xl border border-zinc-800 flex items-center justify-center">
+                <div className="text-center">
+                  <div className={cn(
+                    "text-xs font-bold px-3 py-1 rounded-full",
+                    (stats.tradesTodayCount > dailyGoals.maxTradesPerDay || stats.consecutiveLossesToday >= dailyGoals.maxConsecutiveLosses)
+                      ? "bg-rose-500/10 text-rose-500"
+                      : "bg-emerald-500/10 text-emerald-500"
+                  )}>
+                    {(stats.tradesTodayCount > dailyGoals.maxTradesPerDay || stats.consecutiveLossesToday >= dailyGoals.maxConsecutiveLosses)
+                      ? "STOP TRADING"
+                      : "SAFE TO TRADE"}
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+
+        <div className="flex flex-col items-center justify-center py-20 text-zinc-600">
+          <History className="w-12 h-12 mb-4 opacity-20" />
+          <p className="italic">Not enough closed trades to generate analytics.</p>
+        </div>
       </div>
     );
   }
 
   return (
     <div className="space-y-8 animate-in fade-in duration-500">
+      {/* Risk Management Goals */}
+      <div className="crypto-card p-6">
+        <div className="flex items-center justify-between mb-6">
+          <h3 className="text-sm font-bold uppercase text-zinc-500 flex items-center gap-2">
+            <Shield className="w-4 h-4" /> Daily Risk Management Goals
+          </h3>
+          <button 
+            onClick={() => setIsEditingGoals(!isEditingGoals)}
+            className="text-xs text-emerald-500 hover:text-emerald-400 font-bold"
+          >
+            {isEditingGoals ? 'Cancel' : 'Edit Goals'}
+          </button>
+        </div>
+
+        {isEditingGoals ? (
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+            <div className="space-y-2">
+              <label className="text-[10px] text-zinc-500 uppercase font-bold">Max Trades Per Day</label>
+              <input 
+                type="number" 
+                value={tempGoals.maxTradesPerDay}
+                onChange={(e) => setTempGoals({...tempGoals, maxTradesPerDay: parseInt(e.target.value) || 0})}
+                className="input-field w-full"
+              />
+            </div>
+            <div className="space-y-2">
+              <label className="text-[10px] text-zinc-500 uppercase font-bold">Max Consecutive Losses</label>
+              <input 
+                type="number" 
+                value={tempGoals.maxConsecutiveLosses}
+                onChange={(e) => setTempGoals({...tempGoals, maxConsecutiveLosses: parseInt(e.target.value) || 0})}
+                className="input-field w-full"
+              />
+            </div>
+            <button 
+              onClick={() => {
+                onUpdateDailyGoals(tempGoals);
+                setIsEditingGoals(false);
+              }}
+              className="btn-primary md:col-span-2"
+            >
+              Save Goals
+            </button>
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+            <div className="p-4 bg-zinc-950 rounded-xl border border-zinc-800">
+              <div className="flex justify-between items-center mb-2">
+                <span className="text-xs text-zinc-400">Daily Trade Limit</span>
+                <span className={cn("text-xs font-bold", stats.tradesTodayCount > dailyGoals.maxTradesPerDay ? "text-rose-500" : "text-emerald-500")}>
+                  {stats.tradesTodayCount} / {dailyGoals.maxTradesPerDay}
+                </span>
+              </div>
+              <div className="h-1.5 bg-zinc-900 rounded-full overflow-hidden">
+                <div 
+                  className={cn("h-full", stats.tradesTodayCount > dailyGoals.maxTradesPerDay ? "bg-rose-500" : "bg-emerald-500")} 
+                  style={{ width: `${Math.min(100, (stats.tradesTodayCount / dailyGoals.maxTradesPerDay) * 100)}%` }} 
+                />
+              </div>
+            </div>
+
+            <div className="p-4 bg-zinc-950 rounded-xl border border-zinc-800">
+              <div className="flex justify-between items-center mb-2">
+                <span className="text-xs text-zinc-400">Consecutive Losses</span>
+                <span className={cn("text-xs font-bold", stats.consecutiveLossesToday >= dailyGoals.maxConsecutiveLosses ? "text-rose-500" : "text-emerald-500")}>
+                  {stats.consecutiveLossesToday} / {dailyGoals.maxConsecutiveLosses}
+                </span>
+              </div>
+              <div className="h-1.5 bg-zinc-900 rounded-full overflow-hidden">
+                <div 
+                  className={cn("h-full", stats.consecutiveLossesToday >= dailyGoals.maxConsecutiveLosses ? "bg-rose-500" : "bg-emerald-500")} 
+                  style={{ width: `${Math.min(100, (stats.consecutiveLossesToday / dailyGoals.maxConsecutiveLosses) * 100)}%` }} 
+                />
+              </div>
+            </div>
+
+            <div className="p-4 bg-zinc-950 rounded-xl border border-zinc-800 flex items-center justify-center">
+              <div className="text-center">
+                <div className={cn(
+                  "text-xs font-bold px-3 py-1 rounded-full",
+                  (stats.tradesTodayCount > dailyGoals.maxTradesPerDay || stats.consecutiveLossesToday >= dailyGoals.maxConsecutiveLosses)
+                    ? "bg-rose-500/10 text-rose-500"
+                    : "bg-emerald-500/10 text-emerald-500"
+                )}>
+                  {(stats.tradesTodayCount > dailyGoals.maxTradesPerDay || stats.consecutiveLossesToday >= dailyGoals.maxConsecutiveLosses)
+                    ? "STOP TRADING"
+                    : "SAFE TO TRADE"}
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+
       {/* Top Stats Grid */}
       <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4">
         <div className="crypto-card">
