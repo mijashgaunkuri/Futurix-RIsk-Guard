@@ -69,7 +69,7 @@ import {
   PieChart,
   Pie
 } from 'recharts';
-import { format, subMonths, isSameDay, startOfMonth, endOfMonth, eachDayOfInterval } from 'date-fns';
+import { format, subMonths, isSameDay, startOfMonth, endOfMonth, eachDayOfInterval, subDays, addDays } from 'date-fns';
 import { motion, AnimatePresence } from 'motion/react';
 
 import { Trade, TradeDirection, BalanceHistory, MMRTier } from './types';
@@ -384,7 +384,9 @@ export default function App() {
   const [isAuthReady, setIsAuthReady] = useState(false);
   const [dailyGoals, setDailyGoals] = useState({
     maxTradesPerDay: 4,
-    maxConsecutiveLosses: 2
+    maxConsecutiveLosses: 2,
+    dailyProfitTarget: 50,
+    dailyMaxLoss: 30
   });
 
   // Theme effect
@@ -533,7 +535,12 @@ export default function App() {
       .reduce((sum, t) => sum + t.initialMargin + (t.addedMargin || 0), 0);
   }, [trades]);
 
-  const updateDailyGoals = async (goals: { maxTradesPerDay: number, maxConsecutiveLosses: number }) => {
+  const updateDailyGoals = async (goals: { 
+    maxTradesPerDay: number, 
+    maxConsecutiveLosses: number,
+    dailyProfitTarget: number,
+    dailyMaxLoss: number
+  }) => {
     if (!user) return;
     try {
       setDailyGoals(goals);
@@ -543,11 +550,20 @@ export default function App() {
     }
   };
 
-  const updateBalance = async (amount: number, type: 'DEPOSIT' | 'WITHDRAWAL' | 'TRADE' | 'RESET', note: string = '') => {
+  const updateBalance = async (amount: number, type: 'DEPOSIT' | 'WITHDRAWAL' | 'TRADE' | 'RESET' | 'SET', note: string = '') => {
     if (!user) return;
     try {
       const userRef = doc(db, 'users', user.uid);
-      const newBalance = type === 'TRADE' || type === 'DEPOSIT' || type === 'RESET' ? currentBalance + amount : type === 'WITHDRAWAL' ? currentBalance - amount : amount;
+      let newBalance = currentBalance;
+      
+      if (type === 'SET') {
+        newBalance = amount;
+      } else if (type === 'WITHDRAWAL') {
+        newBalance = currentBalance - amount;
+      } else {
+        // TRADE, DEPOSIT, RESET (adding amount)
+        newBalance = currentBalance + amount;
+      }
       
       const historyId = crypto.randomUUID();
       const newEntry: BalanceHistory = {
@@ -562,10 +578,17 @@ export default function App() {
       const batch = writeBatch(db);
       const historyRef = doc(db, 'users', user.uid, 'balanceHistory', historyId);
       
+      const updates: any = { currentBalance: newBalance };
+      if (startingBalance === 0 && type === 'SET') {
+        updates.startingBalance = newBalance;
+        setStartingBalance(newBalance);
+      }
+      
       batch.set(historyRef, cleanObject(newEntry));
-      batch.update(userRef, { currentBalance: newBalance });
+      batch.update(userRef, updates);
       
       await batch.commit();
+      setCurrentBalance(newBalance);
     } catch (error) {
       handleFirestoreError(error, OperationType.UPDATE, `users/${user.uid}`);
     }
@@ -802,17 +825,14 @@ export default function App() {
       try {
         const batch = writeBatch(db);
         
-        // Delete all trades
         trades.forEach(trade => {
           batch.delete(doc(db, 'users', user.uid, 'trades', trade.id));
         });
         
-        // Delete all balance history
         balanceHistory.forEach(history => {
           batch.delete(doc(db, 'users', user.uid, 'balanceHistory', history.id));
         });
         
-        // Reset user profile
         batch.update(doc(db, 'users', user.uid), {
           startingBalance: 1000,
           currentBalance: 1000
@@ -822,6 +842,39 @@ export default function App() {
         alert('Cloud data cleared.');
       } catch (error) {
         handleFirestoreError(error, OperationType.DELETE, `users/${user.uid}`);
+      }
+    }
+  };
+
+  const clearTrades = async () => {
+    if (!user) return;
+    if (window.confirm('Are you sure you want to clear all trade history? This will reset Win Rate, Profit Factor, and PnL stats.')) {
+      try {
+        const batch = writeBatch(db);
+        trades.forEach(trade => {
+          batch.delete(doc(db, 'users', user.uid, 'trades', trade.id));
+        });
+        await batch.commit();
+      } catch (error) {
+        handleFirestoreError(error, OperationType.DELETE, `users/${user.uid}/trades`);
+      }
+    }
+  };
+
+  const clearHistory = async () => {
+    if (!user) return;
+    if (window.confirm('Are you sure you want to clear all balance history? This will reset Drawdown stats.')) {
+      try {
+        const batch = writeBatch(db);
+        balanceHistory.forEach(history => {
+          batch.delete(doc(db, 'users', user.uid, 'balanceHistory', history.id));
+        });
+        batch.update(doc(db, 'users', user.uid), {
+          startingBalance: currentBalance
+        });
+        await batch.commit();
+      } catch (error) {
+        handleFirestoreError(error, OperationType.DELETE, `users/${user.uid}/balanceHistory`);
       }
     }
   };
@@ -1040,8 +1093,13 @@ export default function App() {
             trades={trades} 
             balanceHistory={balanceHistory}
             startingBalance={startingBalance}
+            currentBalance={currentBalance}
+            onUpdateBalance={updateBalance}
             dailyGoals={dailyGoals}
             onUpdateDailyGoals={updateDailyGoals}
+            onResetAll={clearData}
+            onClearTrades={clearTrades}
+            onClearHistory={clearHistory}
           />
         )}
       </main>
@@ -3841,8 +3899,7 @@ const JournalTab = ({
   importData, 
   importBinanceCSV,
   clearData,
-  setActiveTab,
-  dailyGoals
+  setActiveTab
 }: any) => {
   const [search, setSearch] = useState('');
   const [filterDirection, setFilterDirection] = useState<string>('ALL');
@@ -3858,125 +3915,8 @@ const JournalTab = ({
   const [editedPnl, setEditedPnl] = useState<string>('');
   const [editedFees, setEditedFees] = useState<string>('');
   const [selectedTrades, setSelectedTrades] = useState<string[]>([]);
-  const [dashboardTab, setDashboardTab] = useState('overview');
   const [sortField, setSortField] = useState<keyof Trade>('date');
   const [sortDirection, setSortDirection] = useState<'asc' | 'desc'>('desc');
-
-  const dashboardStats = useMemo(() => {
-    const closed = trades.filter((t: Trade) => t.status === 'CLOSED');
-    const open = trades.filter((t: Trade) => t.status === 'OPEN');
-    const wins = closed.filter((t: Trade) => t.netPnl > 0);
-    const losses = closed.filter((t: Trade) => t.netPnl <= 0);
-    
-    const winRate = closed.length > 0 ? (wins.length / closed.length) * 100 : 0;
-    
-    const grossProfit = wins.reduce((acc, t) => acc + t.netPnl, 0);
-    const grossLoss = Math.abs(losses.reduce((acc, t) => acc + t.netPnl, 0));
-    const profitFactor = grossLoss > 0 ? grossProfit / grossLoss : (grossProfit > 0 ? Infinity : 0);
-    const netPnl = closed.reduce((acc, t) => acc + t.netPnl, 0);
-
-    const avgRR = closed.length > 0 
-      ? closed.reduce((acc, t) => acc + (t.actualRR || 0), 0) / closed.length 
-      : 0;
-    
-    const avgEfficiency = closed.length > 0
-      ? closed.reduce((acc, t) => acc + (t.exitEfficiency || 0), 0) / closed.length
-      : 0;
-
-    const totalDuration = closed.reduce((acc, t) => acc + (t.durationMinutes || 0), 0);
-    const avgDuration = closed.length > 0 ? totalDuration / closed.length : 0;
-    const avgWin = wins.length > 0 ? wins.reduce((acc, t) => acc + t.netPnl, 0) / wins.length : 0;
-    const avgLoss = losses.length > 0 ? Math.abs(losses.reduce((acc, t) => acc + t.netPnl, 0)) / losses.length : 0;
-    const expectancy = (winRate / 100 * avgWin) - ((1 - winRate / 100) * avgLoss);
-
-    // Drawdown Calculation
-    let maxDrawdown = 0;
-    let maxDrawdownPercent = 0;
-    let currentDrawdown = 0;
-    let currentDrawdownPercent = 0;
-    let peak = startingBalance;
-    
-    const sortedHistory = [...balanceHistory].sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
-    
-    sortedHistory.forEach((h) => {
-      if (h.balanceAfter > peak) {
-        peak = h.balanceAfter;
-      }
-      const dd = peak - h.balanceAfter;
-      const ddPct = peak > 0 ? (dd / peak) * 100 : 0;
-      
-      if (dd > maxDrawdown) maxDrawdown = dd;
-      if (ddPct > maxDrawdownPercent) maxDrawdownPercent = ddPct;
-      
-      currentDrawdown = dd;
-      currentDrawdownPercent = ddPct;
-    });
-
-    // Daily Heatmap (last 60 days)
-    const heatmapData = [];
-    const now = new Date();
-    for (let i = 59; i >= 0; i--) {
-      const date = new Date(now);
-      date.setDate(date.getDate() - i);
-      const dateStr = format(date, 'yyyy-MM-dd');
-      
-      const dayTrades = closed.filter(t => format(new Date(t.date), 'yyyy-MM-dd') === dateStr);
-      const dayPnl = dayTrades.reduce((acc, t) => acc + t.netPnl, 0);
-      
-      let status: 'win' | 'loss' | 'none' = 'none';
-      if (dayTrades.length > 0) {
-        status = dayPnl > 0 ? 'win' : 'loss';
-      }
-      
-      heatmapData.push({ date: dateStr, pnl: dayPnl, status });
-    }
-
-    // Daily stats
-    const today = new Date();
-    const todayStr = format(today, 'yyyy-MM-dd');
-    const tradesToday = trades.filter(t => format(new Date(t.date), 'yyyy-MM-dd') === todayStr);
-    const closedToday = tradesToday.filter(t => t.status === 'CLOSED');
-    
-    // Consecutive losses today
-    let maxConsecutiveLossesToday = 0;
-    let currentConsecutiveLossesToday = 0;
-    const sortedClosedToday = [...closedToday].sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
-    
-    sortedClosedToday.forEach(t => {
-      if (t.netPnl <= 0) {
-        currentConsecutiveLossesToday++;
-        if (currentConsecutiveLossesToday > maxConsecutiveLossesToday) {
-          maxConsecutiveLossesToday = currentConsecutiveLossesToday;
-        }
-      } else {
-        currentConsecutiveLossesToday = 0;
-      }
-    });
-
-    return {
-      total: trades.length,
-      closed: closed.length,
-      open: open.length,
-      winRate,
-      wins: wins.length,
-      losses: losses.length,
-      profitFactor,
-      netPnl,
-      avgRR,
-      avgEfficiency,
-      heatmapData,
-      avgDuration,
-      expectancy,
-      avgWin,
-      avgLoss,
-      maxDrawdown,
-      maxDrawdownPercent,
-      currentDrawdown,
-      currentDrawdownPercent,
-      tradesTodayCount: tradesToday.length,
-      consecutiveLossesToday: maxConsecutiveLossesToday
-    };
-  }, [trades, balanceHistory, startingBalance]);
 
   const filteredTrades = useMemo(() => {
     const filtered = trades.filter((t: Trade) => {
@@ -4014,57 +3954,8 @@ const JournalTab = ({
     }
   };
 
-  const insights = useMemo(() => {
-    const closed = trades.filter((t: Trade) => t.status === 'CLOSED');
-    if (closed.length === 0) return null;
-
-    const strategies: Record<string, { wins: number, total: number }> = {};
-    closed.forEach((t: Trade) => {
-      if (!strategies[t.strategy]) strategies[t.strategy] = { wins: 0, total: 0 };
-      strategies[t.strategy].total++;
-      if (t.netPnl > 0) strategies[t.strategy].wins++;
-    });
-
-    const bestStrategy = Object.entries(strategies).reduce((a, b) => 
-      (b[1].wins / b[1].total) > (a[1].wins / a[1].total) ? b : a
-    );
-
-    const avgEfficiency = closed.reduce((acc, t) => acc + (t.exitEfficiency || 0), 0) / closed.length;
-
-    return {
-      bestStrategy: { name: bestStrategy[0], winRate: (bestStrategy[1].wins / bestStrategy[1].total) * 100 },
-      avgEfficiency
-    };
-  }, [trades]);
-
-  const monthlyPnlData = useMemo(() => {
-    const closed = trades.filter((t: Trade) => t.status === 'CLOSED');
-    const months: Record<string, number> = {};
-    
-    // Sort by date first
-    const sortedTrades = [...closed].sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
-    
-    sortedTrades.forEach((t: Trade) => {
-      const month = format(new Date(t.date), 'MMM yyyy');
-      months[month] = (months[month] || 0) + (t.netPnl || 0);
-    });
-
-    return Object.entries(months).map(([name, pnl]) => ({
-      name,
-      pnl: parseFloat(pnl.toFixed(2))
-    }));
-  }, [trades]);
-
-  const equityCurveData = useMemo(() => {
-    const sortedHistory = [...balanceHistory].sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
-    return sortedHistory.map((h: BalanceHistory) => ({
-      date: format(new Date(h.date), 'MMM dd HH:mm'),
-      balance: parseFloat(h.amount.toFixed(2))
-    }));
-  }, [balanceHistory]);
-
   const handleUpdateBalance = () => {
-    onUpdateBalance(newBalanceValue, 'TRADE', balanceNote || 'Manual Balance Update');
+    onUpdateBalance(newBalanceValue, 'SET', balanceNote || 'Manual Balance Update');
     setIsUpdateBalanceOpen(false);
   };
 
@@ -4201,201 +4092,6 @@ const JournalTab = ({
 
   return (
     <div className="space-y-6">
-      {/* Performance Dashboard */}
-      <div className="grid grid-cols-1 lg:grid-cols-4 gap-4">
-        {/* Main Stats */}
-        <div className="lg:col-span-3 grid grid-cols-2 md:grid-cols-4 gap-4">
-          <div className="crypto-card bg-zinc-900/50 border-zinc-800/50">
-            <div className="flex items-center gap-2 mb-2">
-              <div className="p-1.5 rounded-lg bg-emerald-500/10">
-                <TrendingUp className="w-4 h-4 text-emerald-500" />
-              </div>
-              <span className="text-[10px] text-zinc-500 uppercase font-bold">Net PNL</span>
-            </div>
-            <div className={cn("text-2xl font-mono font-bold", dashboardStats.netPnl >= 0 ? "text-emerald-500" : "text-rose-500")}>
-              {dashboardStats.netPnl >= 0 ? '+' : ''}${dashboardStats.netPnl.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-            </div>
-            <div className="text-[10px] text-zinc-500 mt-1">Avg RR: {dashboardStats.avgRR.toFixed(2)}</div>
-          </div>
-
-          <div className="crypto-card bg-zinc-900/50 border-zinc-800/50">
-            <div className="flex items-center gap-2 mb-2">
-              <div className="p-1.5 rounded-lg bg-blue-500/10">
-                <Target className="w-4 h-4 text-blue-500" />
-              </div>
-              <span className="text-[10px] text-zinc-500 uppercase font-bold">Win Rate</span>
-            </div>
-            <div className="text-2xl font-mono font-bold text-zinc-100">
-              {dashboardStats.winRate.toFixed(1)}%
-            </div>
-            <div className="flex items-center gap-2 mt-1">
-              <span className="text-[10px] text-emerald-500 font-bold">{dashboardStats.wins}W</span>
-              <span className="text-[10px] text-rose-500 font-bold">{dashboardStats.losses}L</span>
-            </div>
-          </div>
-
-          <div className="crypto-card bg-zinc-900/50 border-zinc-800/50">
-            <div className="flex items-center gap-2 mb-2">
-              <div className="p-1.5 rounded-lg bg-amber-500/10">
-                <Zap className="w-4 h-4 text-amber-500" />
-              </div>
-              <span className="text-[10px] text-zinc-500 uppercase font-bold">Profit Factor</span>
-            </div>
-            <div className="text-2xl font-mono font-bold text-zinc-100">
-              {dashboardStats.profitFactor === Infinity ? '∞' : dashboardStats.profitFactor.toFixed(2)}
-            </div>
-            <div className="text-[10px] text-zinc-500 mt-1">Expectancy: ${dashboardStats.expectancy.toFixed(2)}</div>
-          </div>
-
-          <div className="crypto-card bg-zinc-900/50 border-zinc-800/50">
-            <div className="flex items-center gap-2 mb-2">
-              <div className="p-1.5 rounded-lg bg-rose-500/10">
-                <ArrowDownRight className="w-4 h-4 text-rose-500" />
-              </div>
-              <span className="text-[10px] text-zinc-500 uppercase font-bold">Max Drawdown</span>
-            </div>
-            <div className="text-2xl font-mono font-bold text-rose-500">
-              {dashboardStats.maxDrawdownPercent.toFixed(1)}%
-            </div>
-            <div className="text-[10px] text-zinc-500 mt-1">
-              Current: {dashboardStats.currentDrawdownPercent.toFixed(1)}%
-            </div>
-          </div>
-
-          <div className="crypto-card bg-zinc-900/50 border-zinc-800/50">
-            <div className="flex items-center gap-2 mb-2">
-              <div className="p-1.5 rounded-lg bg-purple-500/10">
-                <Clock className="w-4 h-4 text-purple-500" />
-              </div>
-              <span className="text-[10px] text-zinc-500 uppercase font-bold">Avg Duration</span>
-            </div>
-            <div className="text-2xl font-mono font-bold text-zinc-100">
-              {formatTradeDuration(dashboardStats.avgDuration)}
-            </div>
-            <div className="text-[10px] text-zinc-500 mt-1">Efficiency: {dashboardStats.avgEfficiency.toFixed(1)}%</div>
-          </div>
-        </div>
-
-        {/* Balance Card */}
-        <div className="crypto-card bg-emerald-500/5 border-emerald-500/20 flex flex-col justify-between">
-          <div className="flex justify-between items-start">
-            <div>
-              <span className="text-[10px] text-emerald-500/70 uppercase font-bold">Current Balance</span>
-              <div className="text-2xl font-mono font-bold text-emerald-500 mt-1">
-                ${currentBalance.toLocaleString(undefined, { minimumFractionDigits: 2 })}
-              </div>
-            </div>
-            <button 
-              onClick={() => setIsUpdateBalanceOpen(true)}
-              className="p-2 rounded-lg bg-emerald-500/10 text-emerald-500 hover:bg-emerald-500/20 transition-colors"
-            >
-              <Wallet className="w-4 h-4" />
-            </button>
-          </div>
-        </div>
-      </div>
-
-      {/* Daily Discipline Checklist */}
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-        <div className="crypto-card bg-zinc-900/50 border-zinc-800/50">
-          <div className="flex items-center justify-between mb-4">
-            <h3 className="text-xs font-bold text-zinc-400 uppercase tracking-wider flex items-center gap-2">
-              <ShieldCheck className="w-4 h-4 text-emerald-500" />
-              Daily Discipline Checklist
-            </h3>
-            <span className="text-[10px] text-zinc-500 font-mono">{format(new Date(), 'EEEE, MMM dd')}</span>
-          </div>
-          <div className="space-y-3">
-            <div className="flex items-center justify-between p-2 rounded-lg bg-zinc-950/50 border border-zinc-800/50">
-              <div className="flex items-center gap-3">
-                <div className={cn(
-                  "w-5 h-5 rounded-full flex items-center justify-center border transition-colors",
-                  dashboardStats.tradesTodayCount <= dailyGoals.maxTradesPerDay ? "bg-emerald-500/10 border-emerald-500/50 text-emerald-500" : "bg-rose-500/10 border-rose-500/50 text-rose-500"
-                )}>
-                  {dashboardStats.tradesTodayCount <= dailyGoals.maxTradesPerDay ? <CheckCircle2 className="w-3 h-3" /> : <AlertTriangle className="w-3 h-3" />}
-                </div>
-                <span className="text-xs text-zinc-300">Max {dailyGoals.maxTradesPerDay} trades per day</span>
-              </div>
-              <span className={cn("text-xs font-mono font-bold", dashboardStats.tradesTodayCount > dailyGoals.maxTradesPerDay ? "text-rose-500" : "text-zinc-400")}>
-                {dashboardStats.tradesTodayCount}/{dailyGoals.maxTradesPerDay}
-              </span>
-            </div>
-
-            <div className="flex items-center justify-between p-2 rounded-lg bg-zinc-950/50 border border-zinc-800/50">
-              <div className="flex items-center gap-3">
-                <div className={cn(
-                  "w-5 h-5 rounded-full flex items-center justify-center border transition-colors",
-                  dashboardStats.consecutiveLossesToday < dailyGoals.maxConsecutiveLosses ? "bg-emerald-500/10 border-emerald-500/50 text-emerald-500" : "bg-rose-500/10 border-rose-500/50 text-rose-500"
-                )}>
-                  {dashboardStats.consecutiveLossesToday < dailyGoals.maxConsecutiveLosses ? <CheckCircle2 className="w-3 h-3" /> : <AlertTriangle className="w-3 h-3" />}
-                </div>
-                <span className="text-xs text-zinc-300">Stop after {dailyGoals.maxConsecutiveLosses} consecutive losses</span>
-              </div>
-              <span className={cn("text-xs font-mono font-bold", dashboardStats.consecutiveLossesToday >= dailyGoals.maxConsecutiveLosses ? "text-rose-500" : "text-zinc-400")}>
-                {dashboardStats.consecutiveLossesToday}/{dailyGoals.maxConsecutiveLosses}
-              </span>
-            </div>
-
-            <div className="flex items-center justify-between p-2 rounded-lg bg-zinc-950/50 border border-zinc-800/50">
-              <div className="flex items-center gap-3">
-                <div className={cn(
-                  "w-5 h-5 rounded-full flex items-center justify-center border transition-colors",
-                  dashboardStats.netPnl >= 0 ? "bg-emerald-500/10 border-emerald-500/50 text-emerald-500" : "bg-zinc-800 border-zinc-700 text-zinc-600"
-                )}>
-                  <Trophy className="w-3 h-3" />
-                </div>
-                <span className="text-xs text-zinc-300">Daily Profit Goal</span>
-              </div>
-              <span className={cn("text-xs font-mono font-bold", dashboardStats.netPnl > 0 ? "text-emerald-500" : "text-zinc-500")}>
-                {dashboardStats.netPnl > 0 ? 'REACHED' : 'PENDING'}
-              </span>
-            </div>
-          </div>
-        </div>
-
-        <div className="crypto-card bg-zinc-900/50 border-zinc-800/50 flex flex-col justify-center">
-          <div className="text-center space-y-2">
-            <div className="inline-flex p-3 rounded-full bg-emerald-500/10 mb-2">
-              <Brain className="w-6 h-6 text-emerald-500" />
-            </div>
-            <h4 className="text-sm font-bold text-zinc-100">Trading Psychology Status</h4>
-            <p className="text-xs text-zinc-500 max-w-[250px] mx-auto">
-              {dashboardStats.consecutiveLossesToday >= dailyGoals.maxConsecutiveLosses 
-                ? "Discipline Alert: You've hit your consecutive loss limit. Step away from the charts to avoid revenge trading."
-                : dashboardStats.tradesTodayCount >= dailyGoals.maxTradesPerDay
-                ? "Daily Limit Reached: You've completed your planned trades for today. Great job sticking to the plan!"
-                : "Market Focus: Stick to your setups and maintain your risk parameters. Quality over quantity."}
-            </p>
-          </div>
-        </div>
-      </div>
-
-      {/* Quick Insights Bar */}
-      {insights && (
-        <div className="flex flex-wrap gap-3">
-          <div className="px-3 py-1.5 rounded-full bg-zinc-900 border border-zinc-800 flex items-center gap-2">
-            <Trophy className="w-3.5 h-3.5 text-emerald-500" />
-            <span className="text-[10px] font-bold text-zinc-400 uppercase">Best Strategy:</span>
-            <span className="text-[10px] font-bold text-zinc-100">{insights.bestStrategy.name} ({insights.bestStrategy.winRate.toFixed(0)}%)</span>
-          </div>
-          <div className="px-3 py-1.5 rounded-full bg-zinc-900 border border-zinc-800 flex items-center gap-2">
-            <Activity className="w-3.5 h-3.5 text-blue-500" />
-            <span className="text-[10px] font-bold text-zinc-400 uppercase">Avg Win:</span>
-            <span className="text-[10px] font-bold text-emerald-500">${dashboardStats.avgWin.toFixed(2)}</span>
-          </div>
-          <div className="px-3 py-1.5 rounded-full bg-zinc-900 border border-zinc-800 flex items-center gap-2">
-            <ArrowDownRight className="w-3.5 h-3.5 text-rose-500" />
-            <span className="text-[10px] font-bold text-zinc-400 uppercase">Avg Loss:</span>
-            <span className="text-[10px] font-bold text-rose-500">${dashboardStats.avgLoss.toFixed(2)}</span>
-          </div>
-          <div className="px-3 py-1.5 rounded-full bg-zinc-900 border border-zinc-800 flex items-center gap-2">
-            <BarChart3 className="w-3.5 h-3.5 text-purple-500" />
-            <span className="text-[10px] font-bold text-zinc-400 uppercase">Open Trades:</span>
-            <span className="text-[10px] font-bold text-zinc-100">{dashboardStats.open}</span>
-          </div>
-        </div>
-      )}
-
       {/* Trade Review Modal */}
       {reviewTrade && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-zinc-950/80 backdrop-blur-sm">
@@ -4668,8 +4364,9 @@ const JournalTab = ({
                   <span className="text-[10px] font-bold hidden md:inline">SCAN</span>
                 </div>
               </button>
-              <button onClick={clearData} className="btn-secondary p-2 text-rose-500 hover:bg-rose-500/10" title="DANGER: Clear All Data">
+              <button onClick={clearData} className="btn-secondary p-2 text-rose-500 hover:bg-rose-500/10 flex items-center gap-2" title="DANGER: Clear All Data">
                 <AlertTriangle className="w-4 h-4" />
+                <span className="text-[10px] font-bold hidden lg:inline">RESET ALL</span>
               </button>
             </div>
           </div>
@@ -5041,43 +4738,6 @@ const JournalTab = ({
         </p>
       </div>
 
-      {isUpdateBalanceOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-zinc-950/80 backdrop-blur-sm">
-          <div className="bg-zinc-900 border border-zinc-800 rounded-2xl w-full max-w-md shadow-2xl">
-            <div className="p-6 border-b border-zinc-800 flex items-center justify-between">
-              <h2 className="text-xl font-bold">Update Balance</h2>
-              <button onClick={() => setIsUpdateBalanceOpen(false)} className="text-zinc-500 hover:text-zinc-100">
-                <RefreshCw className="w-5 h-5 rotate-45" />
-              </button>
-            </div>
-            <div className="p-6 space-y-4">
-              <div className="space-y-2">
-                <label className="text-xs font-semibold text-zinc-500 uppercase">New Balance (USDT)</label>
-                <input 
-                  type="number"
-                  value={newBalanceValue}
-                  onChange={(e) => setNewBalanceValue(Number(e.target.value))}
-                  className="input-field w-full text-xl font-mono"
-                />
-              </div>
-              <div className="space-y-2">
-                <label className="text-xs font-semibold text-zinc-500 uppercase">Note</label>
-                <input 
-                  value={balanceNote}
-                  onChange={(e) => setBalanceNote(e.target.value)}
-                  className="input-field w-full"
-                  placeholder="Deposit, Withdrawal, Correction..."
-                />
-              </div>
-              <div className="flex gap-4 pt-4">
-                <button onClick={() => setIsUpdateBalanceOpen(false)} className="btn-secondary flex-1">Cancel</button>
-                <button onClick={handleUpdateBalance} className="btn-primary flex-1">Update Balance</button>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
-
       {editingPnlTrade && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-zinc-950/80 backdrop-blur-sm">
           <div className="bg-zinc-900 border border-zinc-800 rounded-2xl w-full max-w-md shadow-2xl">
@@ -5131,370 +4791,6 @@ const JournalTab = ({
         />
       )}
 
-      {/* Performance Dashboard */}
-      <div className="space-y-6 mt-8">
-        <div className="flex items-center gap-2">
-          <BarChart3 className="w-6 h-6 text-emerald-500" />
-          <h2 className="text-xl font-bold text-zinc-100">Performance Dashboard</h2>
-        </div>
-
-        {/* Dashboard Tabs */}
-        <div className="flex bg-zinc-900/50 p-1 rounded-xl border border-zinc-800 w-fit">
-          {[
-            { id: 'overview', label: 'Overview', icon: BarChart3 },
-            { id: 'risk', label: 'Risk', icon: Shield },
-            { id: 'psychology', label: 'Psychology', icon: Brain },
-            { id: 'efficiency', label: 'Efficiency', icon: Zap }
-          ].map((tab) => (
-            <button
-              key={tab.id}
-              onClick={() => setDashboardTab(tab.id)}
-              className={cn(
-                "flex items-center gap-2 px-6 py-2 rounded-lg text-sm font-medium transition-all",
-                dashboardTab === tab.id 
-                  ? "bg-zinc-800 text-zinc-100 shadow-lg" 
-                  : "text-zinc-500 hover:text-zinc-300"
-              )}
-            >
-              <tab.icon className={cn("w-4 h-4", dashboardTab === tab.id ? "text-emerald-500" : "")} />
-              {tab.label}
-            </button>
-          ))}
-        </div>
-
-        {dashboardTab === 'overview' && (
-          <>
-            {/* Stat Cards */}
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-              <div className="crypto-card p-6">
-                <p className="text-xs font-bold text-zinc-500 uppercase tracking-wider mb-2">Total Trades</p>
-                <div className="flex items-baseline gap-2">
-                  <span className="text-3xl font-bold text-zinc-100">{dashboardStats.total}</span>
-                </div>
-                <p className="text-[10px] text-zinc-500 mt-1">
-                  {dashboardStats.closed} closed · {dashboardStats.open} open
-                </p>
-              </div>
-
-              <div className="crypto-card p-6">
-                <p className="text-xs font-bold text-zinc-500 uppercase tracking-wider mb-2">Win Rate</p>
-                <div className="flex items-baseline gap-2">
-                  <span className="text-3xl font-bold text-emerald-500">{dashboardStats.winRate.toFixed(1)}%</span>
-                </div>
-                <p className="text-[10px] text-zinc-500 mt-1">
-                  {dashboardStats.wins}W / {dashboardStats.losses}L
-                </p>
-              </div>
-
-              <div className="crypto-card p-6">
-                <p className="text-xs font-bold text-zinc-500 uppercase tracking-wider mb-2">Profit Factor</p>
-                <div className="flex items-baseline gap-2">
-                  <span className="text-3xl font-bold text-zinc-100">
-                    {dashboardStats.profitFactor === Infinity ? '∞' : dashboardStats.profitFactor.toFixed(2)}
-                  </span>
-                </div>
-                <p className="text-[10px] text-zinc-500 mt-1">Gross P / Gross L</p>
-              </div>
-
-              <div className="crypto-card p-6">
-                <p className="text-xs font-bold text-zinc-500 uppercase tracking-wider mb-2">Net PNL</p>
-                <div className="flex items-baseline gap-2">
-                  <span className={cn(
-                    "text-3xl font-bold",
-                    dashboardStats.netPnl >= 0 ? "text-emerald-500" : "text-rose-500"
-                  )}>
-                    {dashboardStats.netPnl >= 0 ? '+' : ''}${Math.abs(dashboardStats.netPnl).toFixed(2)}
-                  </span>
-                </div>
-                <p className="text-[10px] text-zinc-500 mt-1">Avg RR: {dashboardStats.avgRR.toFixed(2)}</p>
-              </div>
-            </div>
-
-            {/* Charts Row */}
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-              <div className="crypto-card p-6">
-                <h3 className="text-xs font-bold text-zinc-500 uppercase tracking-wider mb-6">Equity Curve</h3>
-                <div className="h-[250px] w-full flex items-center justify-center">
-                  {dashboardStats.closed < 2 ? (
-                    <p className="text-sm text-zinc-500 italic">Log at least 2 closed trades to see equity curve</p>
-                  ) : (
-                    <ResponsiveContainer width="100%" height="100%">
-                      <AreaChart data={equityCurveData}>
-                        <defs>
-                          <linearGradient id="colorBalance" x1="0" y1="0" x2="0" y2="1">
-                            <stop offset="5%" stopColor="#3b82f6" stopOpacity={0.3}/>
-                            <stop offset="95%" stopColor="#3b82f6" stopOpacity={0}/>
-                          </linearGradient>
-                        </defs>
-                        <CartesianGrid strokeDasharray="3 3" stroke="#1f2937" vertical={false} />
-                        <XAxis 
-                          dataKey="date" 
-                          stroke="#9ca3af" 
-                          fontSize={10} 
-                          tickLine={false} 
-                          axisLine={false}
-                          hide={equityCurveData.length > 20}
-                        />
-                        <YAxis 
-                          stroke="#9ca3af" 
-                          fontSize={10} 
-                          tickLine={false} 
-                          axisLine={false} 
-                          tickFormatter={(value) => `$${value}`}
-                          domain={['auto', 'auto']}
-                        />
-                        <RechartsTooltip 
-                          contentStyle={{ backgroundColor: '#09090b', border: '1px solid #27272a', borderRadius: '8px', fontSize: '12px' }}
-                          itemStyle={{ color: '#3b82f6' }}
-                          formatter={(value: number) => [`$${value.toFixed(2)}`, 'Balance']}
-                        />
-                        <Area 
-                          type="monotone" 
-                          dataKey="balance" 
-                          stroke="#3b82f6" 
-                          strokeWidth={2}
-                          fillOpacity={1} 
-                          fill="url(#colorBalance)" 
-                        />
-                      </AreaChart>
-                    </ResponsiveContainer>
-                  )}
-                </div>
-              </div>
-
-              <div className="crypto-card p-6">
-                <h3 className="text-xs font-bold text-zinc-500 uppercase tracking-wider mb-6">Monthly PNL</h3>
-                <div className="h-[250px] w-full">
-                  <ResponsiveContainer width="100%" height="100%">
-                    <BarChart data={monthlyPnlData}>
-                      <CartesianGrid strokeDasharray="3 3" stroke="#1f2937" vertical={false} />
-                      <XAxis 
-                        dataKey="name" 
-                        stroke="#9ca3af" 
-                        fontSize={10} 
-                        tickLine={false} 
-                        axisLine={false} 
-                      />
-                      <YAxis 
-                        stroke="#9ca3af" 
-                        fontSize={10} 
-                        tickLine={false} 
-                        axisLine={false} 
-                        tickFormatter={(value) => `$${value}`}
-                      />
-                      <RechartsTooltip 
-                        contentStyle={{ backgroundColor: '#09090b', border: '1px solid #27272a', borderRadius: '8px', fontSize: '12px' }}
-                        itemStyle={{ color: '#10b981' }}
-                        formatter={(value: number) => [`$${value.toFixed(2)}`, 'P&L']}
-                      />
-                      <Bar dataKey="pnl" radius={[4, 4, 0, 0]}>
-                        {monthlyPnlData.map((entry, index) => (
-                          <Cell key={`cell-${index}`} fill={entry.pnl >= 0 ? '#10b981' : '#ef4444'} />
-                        ))}
-                      </Bar>
-                    </BarChart>
-                  </ResponsiveContainer>
-                </div>
-              </div>
-            </div>
-
-            {/* Daily Heatmap */}
-            <div className="crypto-card p-6">
-              <div className="flex items-center justify-between mb-6">
-                <div className="flex items-center gap-2">
-                  <CalendarIcon className="w-4 h-4 text-zinc-500" />
-                  <h3 className="text-xs font-bold text-zinc-500 uppercase tracking-wider">Daily PNL Heatmap</h3>
-                </div>
-                <div className="flex items-center gap-4">
-                  <div className="flex items-center gap-1">
-                    <div className="w-2 h-2 rounded-full bg-emerald-500" />
-                    <span className="text-[10px] text-zinc-500">Win</span>
-                  </div>
-                  <div className="flex items-center gap-1">
-                    <div className="w-2 h-2 rounded-full bg-rose-500" />
-                    <span className="text-[10px] text-zinc-500">Loss</span>
-                  </div>
-                  <div className="flex items-center gap-1">
-                    <div className="w-2 h-2 rounded-full bg-zinc-800" />
-                    <span className="text-[10px] text-zinc-500">None</span>
-                  </div>
-                </div>
-              </div>
-              <div className="flex flex-wrap gap-2">
-                {dashboardStats.heatmapData.map((day) => (
-                  <div 
-                    key={day.date}
-                    title={`${day.date}: $${day.pnl.toFixed(2)}`}
-                    className={cn(
-                      "w-3 h-3 rounded-full transition-all cursor-help",
-                      day.status === 'win' ? "bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.3)]" :
-                      day.status === 'loss' ? "bg-rose-500 shadow-[0_0_8px_rgba(244,63,94,0.3)]" :
-                      "bg-zinc-800"
-                    )}
-                  />
-                ))}
-              </div>
-            </div>
-          </>
-        )}
-
-        {dashboardTab === 'risk' && (
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-6 animate-in fade-in slide-in-from-bottom-4">
-            <div className="crypto-card p-6">
-              <h3 className="text-xs font-bold text-zinc-500 uppercase tracking-wider mb-6">Risk Distribution</h3>
-              <div className="space-y-4">
-                <div className="flex justify-between items-center">
-                  <span className="text-sm text-zinc-400">Avg Risk per Trade</span>
-                  <span className="text-sm font-mono font-bold text-rose-500">
-                    ${(trades.reduce((acc: number, t: Trade) => acc + t.riskAmount, 0) / (trades.length || 1)).toFixed(2)}
-                  </span>
-                </div>
-                <div className="flex justify-between items-center">
-                  <span className="text-sm text-zinc-400">Avg Leverage</span>
-                  <span className="text-sm font-mono font-bold text-amber-500">
-                    {(trades.reduce((acc: number, t: Trade) => acc + t.leverage, 0) / (trades.length || 1)).toFixed(1)}x
-                  </span>
-                </div>
-                <div className="flex justify-between items-center">
-                  <span className="text-sm text-zinc-400">Avg Safety Buffer</span>
-                  <span className="text-sm font-mono font-bold text-emerald-500">
-                    {(trades.reduce((acc: number, t: Trade) => acc + (t.safetyBufferAtEntry || 0), 0) / (trades.length || 1)).toFixed(2)}x
-                  </span>
-                </div>
-              </div>
-            </div>
-            <div className="crypto-card p-6">
-              <h3 className="text-xs font-bold text-zinc-500 uppercase tracking-wider mb-6">Strategy Performance</h3>
-              <div className="space-y-3">
-                {Object.entries(
-                  trades.filter((t: Trade) => t.status === 'CLOSED').reduce((acc: any, t: Trade) => {
-                    if (!acc[t.strategy]) acc[t.strategy] = { wins: 0, total: 0 };
-                    acc[t.strategy].total++;
-                    if (t.netPnl > 0) acc[t.strategy].wins++;
-                    return acc;
-                  }, {})
-                ).map(([name, stats]: [string, any]) => (
-                  <div key={name} className="flex items-center justify-between">
-                    <span className="text-xs text-zinc-400">{name}</span>
-                    <div className="flex items-center gap-3">
-                      <div className="w-24 h-1.5 bg-zinc-800 rounded-full overflow-hidden">
-                        <div 
-                          className="h-full bg-emerald-500" 
-                          style={{ width: `${(stats.wins / stats.total) * 100}%` }} 
-                        />
-                      </div>
-                      <span className="text-xs font-bold text-zinc-200">{((stats.wins / stats.total) * 100).toFixed(0)}%</span>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </div>
-          </div>
-        )}
-
-        {dashboardTab === 'psychology' && (
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-6 animate-in fade-in slide-in-from-bottom-4">
-            <div className="crypto-card p-6">
-              <h3 className="text-xs font-bold text-zinc-500 uppercase tracking-wider mb-6">Plan Adherence</h3>
-              <div className="grid grid-cols-3 gap-4">
-                {['YES', 'PARTIAL', 'NO'].map(status => {
-                  const count = trades.filter(t => t.followedPlan === status).length;
-                  const percent = trades.length > 0 ? (count / trades.length) * 100 : 0;
-                  return (
-                    <div key={status} className="text-center">
-                      <div className="text-lg font-bold text-zinc-100">{count}</div>
-                      <div className="text-[10px] text-zinc-500 uppercase font-bold">{status}</div>
-                      <div className="mt-2 h-1 bg-zinc-800 rounded-full overflow-hidden">
-                        <div 
-                          className={cn(
-                            "h-full",
-                            status === 'YES' ? "bg-emerald-500" : status === 'PARTIAL' ? "bg-amber-500" : "bg-rose-500"
-                          )} 
-                          style={{ width: `${percent}%` }} 
-                        />
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-            <div className="crypto-card p-6">
-              <h3 className="text-xs font-bold text-zinc-500 uppercase tracking-wider mb-6">Emotional Impact</h3>
-              <div className="space-y-3">
-                {EMOTIONS.map(emotion => {
-                  const emotionTrades = trades.filter(t => t.emotion === emotion);
-                  const winRate = emotionTrades.length > 0 
-                    ? (emotionTrades.filter(t => t.netPnl > 0).length / emotionTrades.length) * 100 
-                    : 0;
-                  if (emotionTrades.length === 0) return null;
-                  return (
-                    <div key={emotion} className="flex items-center justify-between">
-                      <span className="text-xs text-zinc-400">{emotion}</span>
-                      <div className="flex items-center gap-3">
-                        <span className="text-[10px] text-zinc-500">{emotionTrades.length} trades</span>
-                        <span className={cn("text-xs font-bold", winRate >= 50 ? "text-emerald-500" : "text-rose-500")}>
-                          {winRate.toFixed(0)}% WR
-                        </span>
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-          </div>
-        )}
-
-        {dashboardTab === 'efficiency' && (
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-6 animate-in fade-in slide-in-from-bottom-4">
-            <div className="crypto-card p-6">
-              <h3 className="text-xs font-bold text-zinc-500 uppercase tracking-wider mb-6">Capture Efficiency</h3>
-              <div className="h-[200px] flex items-center justify-center">
-                <div className="text-center">
-                  <div className="text-5xl font-mono font-bold text-emerald-500">
-                    {dashboardStats.avgEfficiency.toFixed(1)}%
-                  </div>
-                  <p className="text-xs text-zinc-500 mt-2 uppercase font-bold tracking-widest">Average Exit Efficiency</p>
-                </div>
-              </div>
-            </div>
-            <div className="crypto-card p-6">
-              <h3 className="text-xs font-bold text-zinc-500 uppercase tracking-wider mb-6">MFE vs MAE</h3>
-              <div className="space-y-6">
-                <div className="space-y-2">
-                  <div className="flex justify-between text-[10px] text-zinc-500 uppercase font-bold">
-                    <span>Avg Max Favorable Excursion (MFE)</span>
-                    <span className="text-emerald-500">
-                      +{(trades.reduce((acc: number, t: Trade) => acc + (t.mfePercent || 0), 0) / (trades.length || 1)).toFixed(2)}%
-                    </span>
-                  </div>
-                  <div className="h-2 bg-zinc-800 rounded-full overflow-hidden">
-                    <div 
-                      className="h-full bg-emerald-500" 
-                      style={{ width: `${Math.min(100, trades.reduce((acc: number, t: Trade) => acc + (t.mfePercent || 0), 0) / (trades.length || 1) * 5)}%` }} 
-                    />
-                  </div>
-                </div>
-                <div className="space-y-2">
-                  <div className="flex justify-between text-[10px] text-zinc-500 uppercase font-bold">
-                    <span>Avg Max Adverse Excursion (MAE)</span>
-                    <span className="text-rose-500">
-                      -{(trades.reduce((acc: number, t: Trade) => acc + (t.maePercent || 0), 0) / (trades.length || 1)).toFixed(2)}%
-                    </span>
-                  </div>
-                  <div className="h-2 bg-zinc-800 rounded-full overflow-hidden">
-                    <div 
-                      className="h-full bg-rose-500" 
-                      style={{ width: `${Math.min(100, trades.reduce((acc: number, t: Trade) => acc + (t.maePercent || 0), 0) / (trades.length || 1) * 5)}%` }} 
-                    />
-                  </div>
-                </div>
-              </div>
-            </div>
-          </div>
-        )}
-
-      </div>
-
       {/* Full Screen Image Modal */}
       <AnimatePresence>
         {fullScreenImage && (
@@ -5535,9 +4831,23 @@ const JournalTab = ({
   );
 };
 
-const StatsTab = ({ trades, startingBalance, balanceHistory, dailyGoals, onUpdateDailyGoals }: any) => {
+const StatsTab = ({ 
+  trades, 
+  startingBalance, 
+  balanceHistory, 
+  currentBalance,
+  onUpdateBalance,
+  dailyGoals, 
+  onUpdateDailyGoals, 
+  onResetAll, 
+  onClearTrades, 
+  onClearHistory 
+}: any) => {
   const [isEditingGoals, setIsEditingGoals] = useState(false);
   const [tempGoals, setTempGoals] = useState(dailyGoals);
+  const [isUpdateBalanceOpen, setIsUpdateBalanceOpen] = useState(false);
+  const [newBalanceValue, setNewBalanceValue] = useState(currentBalance);
+  const [balanceNote, setBalanceNote] = useState('');
 
   const stats = useMemo(() => {
     const closed = trades.filter((t: Trade) => t.status === 'CLOSED');
@@ -5547,6 +4857,7 @@ const StatsTab = ({ trades, startingBalance, balanceHistory, dailyGoals, onUpdat
     const todayStr = format(today, 'yyyy-MM-dd');
     const tradesToday = trades.filter((t: Trade) => format(new Date(t.date), 'yyyy-MM-dd') === todayStr);
     const closedToday = tradesToday.filter((t: Trade) => t.status === 'CLOSED');
+    const pnlToday = closedToday.reduce((acc, t) => acc + t.netPnl, 0);
     
     let maxConsecutiveLossesToday = 0;
     let currentConsecutiveLossesToday = 0;
@@ -5564,9 +4875,35 @@ const StatsTab = ({ trades, startingBalance, balanceHistory, dailyGoals, onUpdat
     });
 
     if (closed.length === 0) return {
+      winRate: 0,
+      totalNetPnl: 0,
+      totalFees: 0,
+      profitFactor: 0,
+      avgWin: 0,
+      avgLoss: 0,
+      avgEfficiency: 0,
+      avgMfe: 0,
+      avgMae: 0,
+      strategyStats: {},
+      emotionStats: {},
+      revengeTradeStats: { total: 0, wins: 0, pnl: 0 },
+      hourlyData: Array.from({ length: 24 }, (_, i) => ({ hour: i, winRate: 0, total: 0 })),
+      monteCarloPaths: [],
+      totalFundingFees: 0,
+      monthlyData: [],
+      equityData: [],
+      drawdownData: [],
+      maxDrawdown: 0,
+      maxDrawdownPercent: 0,
+      currentDrawdown: 0,
+      currentDrawdownPercent: 0,
+      totalTrades: 0,
       tradesTodayCount: tradesToday.length,
       consecutiveLossesToday: maxConsecutiveLossesToday,
-      totalTrades: 0
+      pnlToday: 0,
+      dailyHeatmap: [],
+      weeklyHeatmap: [],
+      monthlyHeatmap: []
     };
 
     const wins = closed.filter((t: Trade) => t.netPnl > 0);
@@ -5644,12 +4981,59 @@ const StatsTab = ({ trades, startingBalance, balanceHistory, dailyGoals, onUpdat
 
     // Monthly PNL
     const monthlyPnl: Record<string, number> = {};
+    const monthOfYearStats: Record<number, { pnl: number, wins: number, total: number }> = {};
+    const dayOfWeekStats: Record<number, { pnl: number, wins: number, total: number }> = {};
+    
     closed.forEach(t => {
-      const month = format(new Date(t.date), 'MMM yyyy');
-      monthlyPnl[month] = (monthlyPnl[month] || 0) + t.netPnl;
+      const date = new Date(t.date);
+      const monthStr = format(date, 'MMM yyyy');
+      monthlyPnl[monthStr] = (monthlyPnl[monthStr] || 0) + t.netPnl;
+      
+      const monthIdx = date.getMonth(); // 0-11
+      if (!monthOfYearStats[monthIdx]) monthOfYearStats[monthIdx] = { pnl: 0, wins: 0, total: 0 };
+      monthOfYearStats[monthIdx].pnl += t.netPnl;
+      monthOfYearStats[monthIdx].total++;
+      if (t.netPnl > 0) monthOfYearStats[monthIdx].wins++;
+      
+      const dayIdx = date.getDay(); // 0-6 (Sun-Sat)
+      if (!dayOfWeekStats[dayIdx]) dayOfWeekStats[dayIdx] = { pnl: 0, wins: 0, total: 0 };
+      dayOfWeekStats[dayIdx].pnl += t.netPnl;
+      dayOfWeekStats[dayIdx].total++;
+      if (t.netPnl > 0) dayOfWeekStats[dayIdx].wins++;
     });
 
     const monthlyData = Object.entries(monthlyPnl).map(([name, pnl]) => ({ name, pnl }));
+    
+    const monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    const monthlyHeatmap = monthNames.map((name, i) => ({
+      name,
+      pnl: monthOfYearStats[i]?.pnl || 0,
+      winRate: monthOfYearStats[i] ? (monthOfYearStats[i].wins / monthOfYearStats[i].total) * 100 : 0,
+      total: monthOfYearStats[i]?.total || 0
+    }));
+
+    const dayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+    const weeklyHeatmap = dayNames.map((name, i) => ({
+      name,
+      pnl: dayOfWeekStats[i]?.pnl || 0,
+      winRate: dayOfWeekStats[i] ? (dayOfWeekStats[i].wins / dayOfWeekStats[i].total) * 100 : 0,
+      total: dayOfWeekStats[i]?.total || 0
+    }));
+
+    // Daily Heatmap (Last 90 days)
+    const dailyHeatmap = [];
+    const ninetyDaysAgo = subDays(new Date(), 89);
+    for (let i = 0; i < 90; i++) {
+      const d = addDays(ninetyDaysAgo, i);
+      const dStr = format(d, 'yyyy-MM-dd');
+      const dayTrades = closed.filter(t => format(new Date(t.date), 'yyyy-MM-dd') === dStr);
+      const pnl = dayTrades.reduce((acc, t) => acc + t.netPnl, 0);
+      dailyHeatmap.push({
+        date: dStr,
+        pnl,
+        count: dayTrades.length
+      });
+    }
 
     // Drawdown Calculation
     let maxDrawdown = 0;
@@ -5715,149 +5099,194 @@ const StatsTab = ({ trades, startingBalance, balanceHistory, dailyGoals, onUpdat
       currentDrawdownPercent,
       totalTrades: closed.length,
       tradesTodayCount: tradesToday.length,
-      consecutiveLossesToday: maxConsecutiveLossesToday
+      consecutiveLossesToday: maxConsecutiveLossesToday,
+      pnlToday,
+      dailyHeatmap,
+      weeklyHeatmap,
+      monthlyHeatmap,
+      insights: (() => {
+        if (closed.length === 0) return null;
+        const strategies: Record<string, { wins: number, total: number }> = {};
+        closed.forEach((t: Trade) => {
+          if (!strategies[t.strategy]) strategies[t.strategy] = { wins: 0, total: 0 };
+          strategies[t.strategy].total++;
+          if (t.netPnl > 0) strategies[t.strategy].wins++;
+        });
+        const bestStrategy = Object.entries(strategies).reduce((a, b) => 
+          (b[1].wins / b[1].total) > (a[1].wins / a[1].total) ? b : a
+        );
+        return {
+          bestStrategy: { name: bestStrategy[0], winRate: (bestStrategy[1].wins / bestStrategy[1].total) * 100 },
+          avgEfficiency
+        };
+      })()
     };
   }, [trades, startingBalance, balanceHistory]);
 
-  if (!stats || stats.totalTrades === 0) {
-    return (
-      <div className="space-y-8">
-        {/* Risk Management Goals (Always visible) */}
-        <div className="crypto-card p-6">
-          <div className="flex items-center justify-between mb-6">
-            <h3 className="text-sm font-bold uppercase text-zinc-500 flex items-center gap-2">
-              <Shield className="w-4 h-4" /> Daily Risk Management Goals
-            </h3>
-            <button 
-              onClick={() => setIsEditingGoals(!isEditingGoals)}
-              className="text-xs text-emerald-500 hover:text-emerald-400 font-bold"
-            >
-              {isEditingGoals ? 'Cancel' : 'Edit Goals'}
-            </button>
-          </div>
-
-          {isEditingGoals ? (
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-              <div className="space-y-2">
-                <label className="text-[10px] text-zinc-500 uppercase font-bold">Max Trades Per Day</label>
-                <input 
-                  type="number" 
-                  value={tempGoals.maxTradesPerDay}
-                  onChange={(e) => setTempGoals({...tempGoals, maxTradesPerDay: parseInt(e.target.value) || 0})}
-                  className="input-field w-full"
-                />
-              </div>
-              <div className="space-y-2">
-                <label className="text-[10px] text-zinc-500 uppercase font-bold">Max Consecutive Losses</label>
-                <input 
-                  type="number" 
-                  value={tempGoals.maxConsecutiveLosses}
-                  onChange={(e) => setTempGoals({...tempGoals, maxConsecutiveLosses: parseInt(e.target.value) || 0})}
-                  className="input-field w-full"
-                />
-              </div>
-              <button 
-                onClick={() => {
-                  onUpdateDailyGoals(tempGoals);
-                  setIsEditingGoals(false);
-                }}
-                className="btn-primary md:col-span-2"
-              >
-                Save Goals
-              </button>
-            </div>
-          ) : (
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-              <div className="p-4 bg-zinc-950 rounded-xl border border-zinc-800">
-                <div className="flex justify-between items-center mb-2">
-                  <span className="text-xs text-zinc-400">Daily Trade Limit</span>
-                  <span className={cn("text-xs font-bold", stats.tradesTodayCount > dailyGoals.maxTradesPerDay ? "text-rose-500" : "text-emerald-500")}>
-                    {stats.tradesTodayCount} / {dailyGoals.maxTradesPerDay}
-                  </span>
-                </div>
-                <div className="h-1.5 bg-zinc-900 rounded-full overflow-hidden">
-                  <div 
-                    className={cn("h-full", stats.tradesTodayCount > dailyGoals.maxTradesPerDay ? "bg-rose-500" : "bg-emerald-500")} 
-                    style={{ width: `${Math.min(100, (stats.tradesTodayCount / dailyGoals.maxTradesPerDay) * 100)}%` }} 
-                  />
-                </div>
-              </div>
-
-              <div className="p-4 bg-zinc-950 rounded-xl border border-zinc-800">
-                <div className="flex justify-between items-center mb-2">
-                  <span className="text-xs text-zinc-400">Consecutive Losses</span>
-                  <span className={cn("text-xs font-bold", stats.consecutiveLossesToday >= dailyGoals.maxConsecutiveLosses ? "text-rose-500" : "text-emerald-500")}>
-                    {stats.consecutiveLossesToday} / {dailyGoals.maxConsecutiveLosses}
-                  </span>
-                </div>
-                <div className="h-1.5 bg-zinc-900 rounded-full overflow-hidden">
-                  <div 
-                    className={cn("h-full", stats.consecutiveLossesToday >= dailyGoals.maxConsecutiveLosses ? "bg-rose-500" : "bg-emerald-500")} 
-                    style={{ width: `${Math.min(100, (stats.consecutiveLossesToday / dailyGoals.maxConsecutiveLosses) * 100)}%` }} 
-                  />
-                </div>
-              </div>
-
-              <div className="p-4 bg-zinc-950 rounded-xl border border-zinc-800 flex items-center justify-center">
-                <div className="text-center">
-                  <div className={cn(
-                    "text-xs font-bold px-3 py-1 rounded-full",
-                    (stats.tradesTodayCount > dailyGoals.maxTradesPerDay || stats.consecutiveLossesToday >= dailyGoals.maxConsecutiveLosses)
-                      ? "bg-rose-500/10 text-rose-500"
-                      : "bg-emerald-500/10 text-emerald-500"
-                  )}>
-                    {(stats.tradesTodayCount > dailyGoals.maxTradesPerDay || stats.consecutiveLossesToday >= dailyGoals.maxConsecutiveLosses)
-                      ? "STOP TRADING"
-                      : "SAFE TO TRADE"}
-                  </div>
-                </div>
-              </div>
-            </div>
-          )}
-        </div>
-
-        <div className="flex flex-col items-center justify-center py-20 text-zinc-600">
-          <History className="w-12 h-12 mb-4 opacity-20" />
-          <p className="italic">Not enough closed trades to generate analytics.</p>
-        </div>
-      </div>
-    );
-  }
+  const handleUpdateBalance = () => {
+    onUpdateBalance(newBalanceValue, 'SET', balanceNote || 'Manual Balance Update');
+    setIsUpdateBalanceOpen(false);
+  };
 
   return (
-    <div className="space-y-8 animate-in fade-in duration-500">
+    <div className="space-y-6">
+      <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
+        <div>
+          <h2 className="text-2xl font-bold text-zinc-100">Performance Analytics</h2>
+          <p className="text-sm text-zinc-500">Deep dive into your trading behavior and edge.</p>
+        </div>
+        <button 
+          onClick={onResetAll}
+          className="btn-secondary text-rose-500 border-rose-500/20 hover:bg-rose-500/10 flex items-center gap-2"
+        >
+          <AlertTriangle className="w-4 h-4" />
+          RESET ALL DATA
+        </button>
+      </div>
+
+      {/* Quick Insights Bar */}
+      {stats.insights && (
+        <div className="flex flex-wrap gap-3">
+          <div className="px-3 py-1.5 rounded-full bg-zinc-900 border border-zinc-800 flex items-center gap-2">
+            <Trophy className="w-3.5 h-3.5 text-emerald-500" />
+            <span className="text-[10px] font-bold text-zinc-400 uppercase">Best Strategy:</span>
+            <span className="text-[10px] font-bold text-zinc-100">{stats.insights.bestStrategy.name} ({stats.insights.bestStrategy.winRate.toFixed(0)}%)</span>
+          </div>
+          <div className="px-3 py-1.5 rounded-full bg-zinc-900 border border-zinc-800 flex items-center gap-2">
+            <Activity className="w-3.5 h-3.5 text-blue-500" />
+            <span className="text-[10px] font-bold text-zinc-400 uppercase">Avg Win:</span>
+            <span className="text-[10px] font-bold text-emerald-500">${stats.avgWin.toFixed(2)}</span>
+          </div>
+          <div className="px-3 py-1.5 rounded-full bg-zinc-900 border border-zinc-800 flex items-center gap-2">
+            <ArrowDownRight className="w-3.5 h-3.5 text-rose-500" />
+            <span className="text-[10px] font-bold text-zinc-400 uppercase">Avg Loss:</span>
+            <span className="text-[10px] font-bold text-rose-500">${stats.avgLoss.toFixed(2)}</span>
+          </div>
+          <div className="px-3 py-1.5 rounded-full bg-zinc-900 border border-zinc-800 flex items-center gap-2">
+            <Zap className="w-3.5 h-3.5 text-purple-500" />
+            <span className="text-[10px] font-bold text-zinc-400 uppercase">Efficiency:</span>
+            <span className="text-[10px] font-bold text-zinc-100">{stats.avgEfficiency.toFixed(1)}%</span>
+          </div>
+        </div>
+      )}
+
+      <div className="grid grid-cols-1 lg:grid-cols-4 gap-4">
+        {/* Balance Card */}
+        <div className="crypto-card bg-emerald-500/5 border-emerald-500/20 flex flex-col justify-between group hover:border-emerald-500/40 transition-all duration-300">
+          <div className="flex justify-between items-start">
+            <div className="space-y-1">
+              <span className="text-[10px] text-emerald-500/70 uppercase font-bold tracking-widest">Current Balance</span>
+              <div className="flex items-baseline gap-1">
+                <span className="text-2xl font-mono font-bold text-emerald-500">
+                  ${currentBalance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                </span>
+                <span className="text-[10px] text-emerald-500/40 font-mono">USDT</span>
+              </div>
+            </div>
+            <button 
+              onClick={() => {
+                setNewBalanceValue(currentBalance);
+                setIsUpdateBalanceOpen(true);
+              }}
+              className="p-2.5 rounded-xl bg-emerald-500/10 text-emerald-500 hover:bg-emerald-500 hover:text-zinc-950 transition-all duration-300 shadow-lg shadow-emerald-500/10"
+              title="Update Balance"
+            >
+              <Wallet className="w-4 h-4" />
+            </button>
+          </div>
+        </div>
+
+        {/* Psychology Status Card */}
+        <div className="lg:col-span-3 crypto-card bg-zinc-900/50 border-zinc-800/50 flex items-center gap-6">
+          <div className="p-3 rounded-full bg-emerald-500/10">
+            <Brain className="w-6 h-6 text-emerald-500" />
+          </div>
+          <div className="flex-1">
+            <h4 className="text-sm font-bold text-zinc-100">Trading Psychology Status</h4>
+            <p className="text-xs text-zinc-500 mt-1">
+              {stats.pnlToday <= -dailyGoals.dailyMaxLoss
+                ? "Risk Alert: You've hit your daily loss limit. Stop trading immediately to protect your capital."
+                : stats.consecutiveLossesToday >= dailyGoals.maxConsecutiveLosses 
+                ? "Discipline Alert: You've hit your consecutive loss limit. Step away from the charts to avoid revenge trading."
+                : stats.pnlToday >= dailyGoals.dailyProfitTarget
+                ? "Goal Achieved: You've hit your daily profit target. Consider closing for the day to lock in gains."
+                : stats.tradesTodayCount >= dailyGoals.maxTradesPerDay
+                ? "Daily Limit Reached: You've completed your planned trades for today. Great job sticking to the plan!"
+                : "Market Focus: Stick to your setups and maintain your risk parameters. Quality over quantity."}
+            </p>
+          </div>
+          <div className="hidden md:block text-right">
+            <span className={cn(
+              "text-[10px] font-bold px-3 py-1 rounded-full",
+              (stats.tradesTodayCount > dailyGoals.maxTradesPerDay || stats.consecutiveLossesToday >= dailyGoals.maxConsecutiveLosses || stats.pnlToday <= -dailyGoals.dailyMaxLoss)
+                ? "bg-rose-500/10 text-rose-500"
+                : (stats.pnlToday >= dailyGoals.dailyProfitTarget)
+                  ? "bg-emerald-500/10 text-emerald-500"
+                  : "bg-emerald-500/10 text-emerald-500"
+            )}>
+              {(stats.tradesTodayCount > dailyGoals.maxTradesPerDay || stats.consecutiveLossesToday >= dailyGoals.maxConsecutiveLosses || stats.pnlToday <= -dailyGoals.dailyMaxLoss)
+                ? "STOP TRADING"
+                : (stats.pnlToday >= dailyGoals.dailyProfitTarget)
+                  ? "GOAL REACHED"
+                  : "SAFE TO TRADE"}
+            </span>
+          </div>
+        </div>
+      </div>
+
       {/* Risk Management Goals */}
-      <div className="crypto-card p-6">
-        <div className="flex items-center justify-between mb-6">
-          <h3 className="text-sm font-bold uppercase text-zinc-500 flex items-center gap-2">
-            <Shield className="w-4 h-4" /> Daily Risk Management Goals
-          </h3>
+      <div className="crypto-card p-6 border-zinc-800/50 bg-zinc-900/30">
+        <div className="flex items-center justify-between mb-8">
+          <div>
+            <h3 className="text-sm font-bold uppercase text-zinc-100 flex items-center gap-2 tracking-wider">
+              <Shield className="w-4 h-4 text-emerald-500" /> Daily Risk Management
+            </h3>
+            <p className="text-[10px] text-zinc-500 uppercase mt-1 font-bold">Protect your capital • Trade with discipline</p>
+          </div>
           <button 
             onClick={() => setIsEditingGoals(!isEditingGoals)}
-            className="text-xs text-emerald-500 hover:text-emerald-400 font-bold"
+            className="px-3 py-1.5 rounded-lg bg-zinc-800 text-[10px] text-zinc-400 hover:text-emerald-500 hover:bg-emerald-500/10 transition-all font-bold uppercase tracking-widest border border-zinc-700/50"
           >
-            {isEditingGoals ? 'Cancel' : 'Edit Goals'}
+            {isEditingGoals ? 'Cancel' : 'Configure Goals'}
           </button>
         </div>
 
         {isEditingGoals ? (
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 animate-in fade-in slide-in-from-top-4 duration-300">
             <div className="space-y-2">
-              <label className="text-[10px] text-zinc-500 uppercase font-bold">Max Trades Per Day</label>
+              <label className="text-[10px] text-zinc-500 uppercase font-bold tracking-widest">Max Trades / Day</label>
               <input 
                 type="number" 
                 value={tempGoals.maxTradesPerDay}
                 onChange={(e) => setTempGoals({...tempGoals, maxTradesPerDay: parseInt(e.target.value) || 0})}
-                className="input-field w-full"
+                className="input-field w-full bg-zinc-950/50 border-zinc-800 focus:border-emerald-500/50 transition-all"
               />
             </div>
             <div className="space-y-2">
-              <label className="text-[10px] text-zinc-500 uppercase font-bold">Max Consecutive Losses</label>
+              <label className="text-[10px] text-zinc-500 uppercase font-bold tracking-widest">Max Consecutive Losses</label>
               <input 
                 type="number" 
                 value={tempGoals.maxConsecutiveLosses}
                 onChange={(e) => setTempGoals({...tempGoals, maxConsecutiveLosses: parseInt(e.target.value) || 0})}
-                className="input-field w-full"
+                className="input-field w-full bg-zinc-950/50 border-zinc-800 focus:border-emerald-500/50 transition-all"
+              />
+            </div>
+            <div className="space-y-2">
+              <label className="text-[10px] text-zinc-500 uppercase font-bold tracking-widest">Daily Profit Target ($)</label>
+              <input 
+                type="number" 
+                value={tempGoals.dailyProfitTarget}
+                onChange={(e) => setTempGoals({...tempGoals, dailyProfitTarget: parseInt(e.target.value) || 0})}
+                className="input-field w-full bg-zinc-950/50 border-zinc-800 focus:border-emerald-500/50 transition-all"
+              />
+            </div>
+            <div className="space-y-2">
+              <label className="text-[10px] text-zinc-500 uppercase font-bold tracking-widest">Daily Max Loss ($)</label>
+              <input 
+                type="number" 
+                value={tempGoals.dailyMaxLoss}
+                onChange={(e) => setTempGoals({...tempGoals, dailyMaxLoss: parseInt(e.target.value) || 0})}
+                className="input-field w-full bg-zinc-950/50 border-zinc-800 focus:border-emerald-500/50 transition-all"
               />
             </div>
             <button 
@@ -5865,54 +5294,114 @@ const StatsTab = ({ trades, startingBalance, balanceHistory, dailyGoals, onUpdat
                 onUpdateDailyGoals(tempGoals);
                 setIsEditingGoals(false);
               }}
-              className="btn-primary md:col-span-2"
+              className="btn-primary md:col-span-2 lg:col-span-4 bg-emerald-500 hover:bg-emerald-400 text-zinc-950 font-black uppercase tracking-widest py-3 shadow-lg shadow-emerald-500/20"
             >
-              Save Goals
+              Apply Risk Parameters
             </button>
           </div>
         ) : (
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-            <div className="p-4 bg-zinc-950 rounded-xl border border-zinc-800">
-              <div className="flex justify-between items-center mb-2">
-                <span className="text-xs text-zinc-400">Daily Trade Limit</span>
-                <span className={cn("text-xs font-bold", stats.tradesTodayCount > dailyGoals.maxTradesPerDay ? "text-rose-500" : "text-emerald-500")}>
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+            {/* Trade Limit */}
+            <div className="p-4 bg-zinc-950/30 rounded-2xl border border-zinc-800/50 hover:border-zinc-700/50 transition-all group">
+              <div className="flex justify-between items-center mb-3">
+                <span className="text-[10px] text-zinc-500 uppercase font-bold tracking-widest group-hover:text-zinc-400 transition-colors">Trade Limit</span>
+                <span className={cn(
+                  "text-xs font-mono font-bold px-2 py-0.5 rounded bg-zinc-900",
+                  stats.tradesTodayCount > dailyGoals.maxTradesPerDay ? "text-rose-500" : "text-emerald-500"
+                )}>
                   {stats.tradesTodayCount} / {dailyGoals.maxTradesPerDay}
                 </span>
               </div>
-              <div className="h-1.5 bg-zinc-900 rounded-full overflow-hidden">
-                <div 
-                  className={cn("h-full", stats.tradesTodayCount > dailyGoals.maxTradesPerDay ? "bg-rose-500" : "bg-emerald-500")} 
-                  style={{ width: `${Math.min(100, (stats.tradesTodayCount / dailyGoals.maxTradesPerDay) * 100)}%` }} 
+              <div className="h-2 bg-zinc-900/50 rounded-full overflow-hidden border border-zinc-800/50">
+                <motion.div 
+                  initial={{ width: 0 }}
+                  animate={{ width: `${Math.min(100, (stats.tradesTodayCount / dailyGoals.maxTradesPerDay) * 100)}%` }}
+                  className={cn("h-full transition-all duration-500", stats.tradesTodayCount > dailyGoals.maxTradesPerDay ? "bg-rose-500 shadow-[0_0_10px_rgba(244,63,94,0.3)]" : "bg-emerald-500 shadow-[0_0_10px_rgba(16,185,129,0.3)]")} 
                 />
               </div>
             </div>
 
-            <div className="p-4 bg-zinc-950 rounded-xl border border-zinc-800">
-              <div className="flex justify-between items-center mb-2">
-                <span className="text-xs text-zinc-400">Consecutive Losses</span>
-                <span className={cn("text-xs font-bold", stats.consecutiveLossesToday >= dailyGoals.maxConsecutiveLosses ? "text-rose-500" : "text-emerald-500")}>
+            {/* Consecutive Losses */}
+            <div className="p-4 bg-zinc-950/30 rounded-2xl border border-zinc-800/50 hover:border-zinc-700/50 transition-all group">
+              <div className="flex justify-between items-center mb-3">
+                <span className="text-[10px] text-zinc-500 uppercase font-bold tracking-widest group-hover:text-zinc-400 transition-colors">Loss Streak</span>
+                <span className={cn(
+                  "text-xs font-mono font-bold px-2 py-0.5 rounded bg-zinc-900",
+                  stats.consecutiveLossesToday >= dailyGoals.maxConsecutiveLosses ? "text-rose-500" : "text-emerald-500"
+                )}>
                   {stats.consecutiveLossesToday} / {dailyGoals.maxConsecutiveLosses}
                 </span>
               </div>
-              <div className="h-1.5 bg-zinc-900 rounded-full overflow-hidden">
-                <div 
-                  className={cn("h-full", stats.consecutiveLossesToday >= dailyGoals.maxConsecutiveLosses ? "bg-rose-500" : "bg-emerald-500")} 
-                  style={{ width: `${Math.min(100, (stats.consecutiveLossesToday / dailyGoals.maxConsecutiveLosses) * 100)}%` }} 
+              <div className="h-2 bg-zinc-900/50 rounded-full overflow-hidden border border-zinc-800/50">
+                <motion.div 
+                  initial={{ width: 0 }}
+                  animate={{ width: `${Math.min(100, (stats.consecutiveLossesToday / dailyGoals.maxConsecutiveLosses) * 100)}%` }}
+                  className={cn("h-full transition-all duration-500", stats.consecutiveLossesToday >= dailyGoals.maxConsecutiveLosses ? "bg-rose-500 shadow-[0_0_10px_rgba(244,63,94,0.3)]" : "bg-emerald-500 shadow-[0_0_10px_rgba(16,185,129,0.3)]")} 
                 />
               </div>
             </div>
 
-            <div className="p-4 bg-zinc-950 rounded-xl border border-zinc-800 flex items-center justify-center">
-              <div className="text-center">
-                <div className={cn(
-                  "text-xs font-bold px-3 py-1 rounded-full",
-                  (stats.tradesTodayCount > dailyGoals.maxTradesPerDay || stats.consecutiveLossesToday >= dailyGoals.maxConsecutiveLosses)
-                    ? "bg-rose-500/10 text-rose-500"
-                    : "bg-emerald-500/10 text-emerald-500"
+            {/* Daily PnL */}
+            <div className="p-4 bg-zinc-950/30 rounded-2xl border border-zinc-800/50 hover:border-zinc-700/50 transition-all group">
+              <div className="flex justify-between items-center mb-3">
+                <span className="text-[10px] text-zinc-500 uppercase font-bold tracking-widest group-hover:text-zinc-400 transition-colors">Daily PnL</span>
+                <span className={cn(
+                  "text-xs font-mono font-bold px-2 py-0.5 rounded bg-zinc-900",
+                  stats.pnlToday >= dailyGoals.dailyProfitTarget ? "text-emerald-500" : (stats.pnlToday <= -dailyGoals.dailyMaxLoss ? "text-rose-500" : "text-zinc-400")
                 )}>
-                  {(stats.tradesTodayCount > dailyGoals.maxTradesPerDay || stats.consecutiveLossesToday >= dailyGoals.maxConsecutiveLosses)
+                  ${stats.pnlToday.toFixed(0)}
+                </span>
+              </div>
+              <div className="h-2 bg-zinc-900/50 rounded-full overflow-hidden border border-zinc-800/50 relative">
+                {/* Center marker for 0 */}
+                <div className="absolute left-1/2 top-0 bottom-0 w-px bg-zinc-700/50 z-10" />
+                <motion.div 
+                  initial={{ width: 0, left: '50%' }}
+                  animate={{ 
+                    width: stats.pnlToday >= 0 
+                      ? `${Math.min(50, (stats.pnlToday / dailyGoals.dailyProfitTarget) * 50)}%`
+                      : `${Math.min(50, (Math.abs(stats.pnlToday) / dailyGoals.dailyMaxLoss) * 50)}%`,
+                    left: stats.pnlToday >= 0 ? '50%' : `${50 - Math.min(50, (Math.abs(stats.pnlToday) / dailyGoals.dailyMaxLoss) * 50)}%`
+                  }}
+                  className={cn(
+                    "h-full transition-all duration-500 absolute", 
+                    stats.pnlToday >= 0 
+                      ? "bg-emerald-500 shadow-[0_0_10px_rgba(16,185,129,0.3)]" 
+                      : "bg-rose-500 shadow-[0_0_10px_rgba(244,63,94,0.3)]"
+                  )} 
+                />
+              </div>
+              <div className="flex justify-between mt-2 px-0.5">
+                <span className="text-[8px] text-zinc-600 font-bold">-${dailyGoals.dailyMaxLoss}</span>
+                <span className="text-[8px] text-zinc-600 font-bold">+$0</span>
+                <span className="text-[8px] text-zinc-600 font-bold">+${dailyGoals.dailyProfitTarget}</span>
+              </div>
+            </div>
+
+            {/* Status Indicator */}
+            <div className="p-4 bg-zinc-950/30 rounded-2xl border border-zinc-800/50 flex items-center justify-center relative overflow-hidden group">
+              <div className={cn(
+                "absolute inset-0 opacity-5 transition-opacity duration-500 group-hover:opacity-10",
+                (stats.tradesTodayCount > dailyGoals.maxTradesPerDay || stats.consecutiveLossesToday >= dailyGoals.maxConsecutiveLosses || stats.pnlToday <= -dailyGoals.dailyMaxLoss)
+                  ? "bg-rose-500"
+                  : (stats.pnlToday >= dailyGoals.dailyProfitTarget)
+                    ? "bg-emerald-500"
+                    : "bg-blue-500"
+              )} />
+              <div className="text-center relative z-10">
+                <div className={cn(
+                  "text-[10px] font-black px-4 py-2 rounded-xl border uppercase tracking-[0.2em] transition-all duration-500",
+                  (stats.tradesTodayCount > dailyGoals.maxTradesPerDay || stats.consecutiveLossesToday >= dailyGoals.maxConsecutiveLosses || stats.pnlToday <= -dailyGoals.dailyMaxLoss)
+                    ? "bg-rose-500/10 text-rose-500 border-rose-500/20 shadow-[0_0_20px_rgba(244,63,94,0.1)]"
+                    : (stats.pnlToday >= dailyGoals.dailyProfitTarget)
+                      ? "bg-emerald-500/10 text-emerald-500 border-emerald-500/20 shadow-[0_0_20px_rgba(16,185,129,0.1)]"
+                      : "bg-blue-500/10 text-blue-500 border-blue-500/20 shadow-[0_0_20px_rgba(59,130,246,0.1)]"
+                )}>
+                  {(stats.tradesTodayCount > dailyGoals.maxTradesPerDay || stats.consecutiveLossesToday >= dailyGoals.maxConsecutiveLosses || stats.pnlToday <= -dailyGoals.dailyMaxLoss)
                     ? "STOP TRADING"
-                    : "SAFE TO TRADE"}
+                    : (stats.pnlToday >= dailyGoals.dailyProfitTarget)
+                      ? "GOAL REACHED"
+                      : "SAFE TO TRADE"}
                 </div>
               </div>
             </div>
@@ -5922,30 +5411,77 @@ const StatsTab = ({ trades, startingBalance, balanceHistory, dailyGoals, onUpdat
 
       {/* Top Stats Grid */}
       <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4">
-        <div className="crypto-card">
-          <span className="text-[10px] text-zinc-500 uppercase font-bold tracking-wider">Win Rate</span>
+        <div className="crypto-card relative">
+          <div className="flex justify-between items-start">
+            <span className="text-[10px] text-zinc-500 uppercase font-bold tracking-wider">Win Rate</span>
+            <button 
+              onClick={onClearTrades}
+              className="p-1 rounded-md bg-zinc-800/50 hover:bg-rose-500/10 text-zinc-500 hover:text-rose-500 transition-all border border-zinc-700/50"
+              title="Reset Win Rate (Clears Trades)"
+            >
+              <RefreshCw className="w-3 h-3" />
+            </button>
+          </div>
           <div className="text-2xl font-mono font-bold text-emerald-500 mt-1">{stats.winRate.toFixed(1)}%</div>
           <div className="text-[10px] text-zinc-500 mt-1">{stats.totalTrades} total trades</div>
         </div>
-        <div className="crypto-card">
-          <span className="text-[10px] text-zinc-500 uppercase font-bold tracking-wider">Profit Factor</span>
+        <div className="crypto-card relative">
+          <div className="flex justify-between items-start">
+            <span className="text-[10px] text-zinc-500 uppercase font-bold tracking-wider">Profit Factor</span>
+            <button 
+              onClick={onClearTrades}
+              className="p-1 rounded-md bg-zinc-800/50 hover:bg-rose-500/10 text-zinc-500 hover:text-rose-500 transition-all border border-zinc-700/50"
+              title="Reset Profit Factor (Clears Trades)"
+            >
+              <RefreshCw className="w-3 h-3" />
+            </button>
+          </div>
           <div className="text-2xl font-mono font-bold text-blue-500 mt-1">{stats.profitFactor.toFixed(2)}</div>
           <div className="text-[10px] text-zinc-500 mt-1">Avg W/L: {(stats.avgWin / (stats.avgLoss || 1)).toFixed(2)}</div>
         </div>
-        <div className="crypto-card">
-          <span className="text-[10px] text-zinc-500 uppercase font-bold tracking-wider">Total Net PNL</span>
+        <div className="crypto-card relative">
+          <div className="flex justify-between items-start">
+            <span className="text-[10px] text-zinc-500 uppercase font-bold tracking-wider">Total Net PNL</span>
+            <button 
+              onClick={onClearTrades}
+              className="p-1 rounded-md bg-zinc-800/50 hover:bg-rose-500/10 text-zinc-500 hover:text-rose-500 transition-all border border-zinc-700/50"
+              title="Reset PNL (Clears Trades)"
+            >
+              <RefreshCw className="w-3 h-3" />
+            </button>
+          </div>
           <div className={cn("text-2xl font-mono font-bold mt-1", stats.totalNetPnl >= 0 ? "text-emerald-500" : "text-rose-500")}>
             ${stats.totalNetPnl.toFixed(2)}
           </div>
           <div className="text-[10px] text-zinc-500 mt-1">Fees: ${stats.totalFees.toFixed(2)}</div>
         </div>
-        <div className="crypto-card">
-          <span className="text-[10px] text-zinc-500 uppercase font-bold tracking-wider">Avg Efficiency</span>
-          <div className="text-2xl font-mono font-bold text-amber-500 mt-1">{stats.avgEfficiency.toFixed(1)}%</div>
-          <div className="text-[10px] text-zinc-500 mt-1">MFE: {stats.avgMfe.toFixed(1)}% | MAE: {stats.avgMae.toFixed(1)}%</div>
+        <div className="crypto-card relative">
+          <div className="flex justify-between items-start">
+            <span className="text-[10px] text-zinc-500 uppercase font-bold tracking-wider">Avg Duration</span>
+            <button 
+              onClick={onClearTrades}
+              className="p-1 rounded-md bg-zinc-800/50 hover:bg-rose-500/10 text-zinc-500 hover:text-rose-500 transition-all border border-zinc-700/50"
+              title="Reset Duration (Clears Trades)"
+            >
+              <RefreshCw className="w-3 h-3" />
+            </button>
+          </div>
+          <div className="text-2xl font-mono font-bold text-purple-500 mt-1">
+            {stats.totalTrades > 0 ? (trades.filter((t: Trade) => t.status === 'CLOSED').reduce((acc: number, t: Trade) => acc + (t.durationMinutes || 0), 0) / stats.totalTrades).toFixed(0) : '0'}m
+          </div>
+          <div className="text-[10px] text-zinc-500 mt-1">Efficiency: {stats.avgEfficiency.toFixed(1)}%</div>
         </div>
-        <div className="crypto-card">
-          <span className="text-[10px] text-zinc-500 uppercase font-bold tracking-wider">Max Drawdown</span>
+        <div className="crypto-card relative">
+          <div className="flex justify-between items-start">
+            <span className="text-[10px] text-zinc-500 uppercase font-bold tracking-wider">Max Drawdown</span>
+            <button 
+              onClick={onClearHistory}
+              className="p-1 rounded-md bg-zinc-800/50 hover:bg-rose-500/10 text-zinc-500 hover:text-rose-500 transition-all border border-zinc-700/50"
+              title="Reset Drawdown (Clears History)"
+            >
+              <RefreshCw className="w-3 h-3" />
+            </button>
+          </div>
           <div className="text-2xl font-mono font-bold text-rose-500 mt-1">{stats.maxDrawdownPercent.toFixed(1)}%</div>
           <div className="text-[10px] text-zinc-500 mt-1">Current: {stats.currentDrawdownPercent.toFixed(1)}%</div>
         </div>
@@ -5955,6 +5491,14 @@ const StatsTab = ({ trades, startingBalance, balanceHistory, dailyGoals, onUpdat
           <div className="text-[10px] text-zinc-500 mt-1">{( (stats.totalFundingFees / (stats.totalFees || 1)) * 100 ).toFixed(1)}% of total fees</div>
         </div>
       </div>
+
+      {stats.totalTrades === 0 ? (
+        <div className="flex flex-col items-center justify-center py-20 text-zinc-600">
+          <History className="w-12 h-12 mb-4 opacity-20" />
+          <p className="italic">Not enough closed trades to generate analytics.</p>
+        </div>
+      ) : (
+        <div className="space-y-8">
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* Equity Curve */}
@@ -6132,6 +5676,130 @@ const StatsTab = ({ trades, startingBalance, balanceHistory, dailyGoals, onUpdat
         </div>
       </div>
 
+      {/* Performance Heatmaps */}
+      <div className="crypto-card p-6 bg-zinc-900/30 border-zinc-800/50">
+        <div className="flex items-center justify-between mb-8">
+          <div>
+            <h3 className="text-sm font-bold uppercase text-zinc-100 flex items-center gap-2 tracking-wider">
+              <CalendarIcon className="w-4 h-4 text-emerald-500" /> Performance Heatmaps
+            </h3>
+            <p className="text-[10px] text-zinc-500 uppercase mt-1 font-bold">Visualizing your edge across time</p>
+          </div>
+        </div>
+        
+        <div className="space-y-10">
+          {/* Daily Heatmap */}
+          <div className="p-4 bg-zinc-950/30 rounded-2xl border border-zinc-800/50">
+            <div className="flex items-center justify-between mb-6">
+              <span className="text-[10px] text-zinc-500 uppercase font-bold tracking-widest">Daily Performance (Last 90 Days)</span>
+              <div className="flex items-center gap-3">
+                <span className="text-[8px] text-zinc-600 uppercase font-bold">Loss</span>
+                <div className="flex gap-1">
+                  <div className="w-2.5 h-2.5 rounded-sm bg-rose-500 shadow-[0_0_5px_rgba(244,63,94,0.2)]" />
+                  <div className="w-2.5 h-2.5 rounded-sm bg-rose-500/30" />
+                  <div className="w-2.5 h-2.5 rounded-sm bg-zinc-800" />
+                  <div className="w-2.5 h-2.5 rounded-sm bg-emerald-500/30" />
+                  <div className="w-2.5 h-2.5 rounded-sm bg-emerald-500 shadow-[0_0_5px_rgba(16,185,129,0.2)]" />
+                </div>
+                <span className="text-[8px] text-zinc-600 uppercase font-bold">Profit</span>
+              </div>
+            </div>
+            <div className="flex flex-wrap gap-1.5">
+              {stats.dailyHeatmap.map((day: any) => {
+                let colorClass = "bg-zinc-800";
+                if (day.pnl > 0) {
+                  colorClass = day.pnl > 100 ? "bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.2)]" : "bg-emerald-500/30";
+                } else if (day.pnl < 0) {
+                  colorClass = day.pnl < -100 ? "bg-rose-500 shadow-[0_0_8px_rgba(244,63,94,0.2)]" : "bg-rose-500/30";
+                }
+                return (
+                  <div 
+                    key={day.date}
+                    className={cn(
+                      "w-3.5 h-3.5 rounded-sm transition-all hover:scale-150 hover:z-20 cursor-help border border-white/0 hover:border-white/20", 
+                      colorClass
+                    )}
+                    title={`${format(new Date(day.date), 'MMM dd, yyyy')}: ${day.pnl >= 0 ? '+' : ''}$${day.pnl.toFixed(2)} (${day.count} trades)`}
+                  />
+                );
+              })}
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+            {/* Weekly Heatmap */}
+            <div className="p-4 bg-zinc-950/30 rounded-2xl border border-zinc-800/50">
+              <span className="text-[10px] text-zinc-500 uppercase font-bold tracking-widest block mb-6">Weekly Performance (By Day of Week)</span>
+              <div className="grid grid-cols-7 gap-3">
+                {stats.weeklyHeatmap.map((day: any) => {
+                  let colorClass = "bg-zinc-800/50";
+                  if (day.total > 0) {
+                    if (day.pnl > 0) {
+                      colorClass = day.winRate > 60 ? "bg-emerald-500 shadow-[0_0_10px_rgba(16,185,129,0.2)]" : "bg-emerald-500/30";
+                    } else if (day.pnl < 0) {
+                      colorClass = day.winRate < 40 ? "bg-rose-500 shadow-[0_0_10px_rgba(244,63,94,0.2)]" : "bg-rose-500/30";
+                    }
+                  }
+                  return (
+                    <div key={day.name} className="space-y-3">
+                      <div 
+                        className={cn(
+                          "aspect-square rounded-xl flex items-center justify-center transition-all hover:scale-110 border border-white/0 hover:border-white/10", 
+                          colorClass
+                        )}
+                        title={`${day.name}: ${day.pnl >= 0 ? '+' : ''}$${day.pnl.toFixed(2)} (${day.winRate.toFixed(1)}% WR over ${day.total} trades)`}
+                      >
+                        <span className="text-[10px] font-black text-zinc-100">{day.name[0]}</span>
+                      </div>
+                      <div className="text-center">
+                        <div className={cn("text-[9px] font-mono font-bold", day.pnl >= 0 ? "text-emerald-500" : "text-rose-500")}>
+                          {day.pnl >= 0 ? '+' : ''}{Math.round(day.pnl)}
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* Monthly Heatmap */}
+            <div className="p-4 bg-zinc-950/30 rounded-2xl border border-zinc-800/50">
+              <span className="text-[10px] text-zinc-500 uppercase font-bold tracking-widest block mb-6">Monthly Performance (By Month of Year)</span>
+              <div className="grid grid-cols-6 sm:grid-cols-12 gap-2">
+                {stats.monthlyHeatmap.map((month: any) => {
+                  let colorClass = "bg-zinc-800/50";
+                  if (month.total > 0) {
+                    if (month.pnl > 0) {
+                      colorClass = month.winRate > 60 ? "bg-emerald-500 shadow-[0_0_10px_rgba(16,185,129,0.2)]" : "bg-emerald-500/30";
+                    } else if (month.pnl < 0) {
+                      colorClass = month.winRate < 40 ? "bg-rose-500 shadow-[0_0_10px_rgba(244,63,94,0.2)]" : "bg-rose-500/30";
+                    }
+                  }
+                  return (
+                    <div key={month.name} className="space-y-3">
+                      <div 
+                        className={cn(
+                          "aspect-square rounded-lg flex items-center justify-center transition-all hover:scale-110 border border-white/0 hover:border-white/10", 
+                          colorClass
+                        )}
+                        title={`${month.name}: ${month.pnl >= 0 ? '+' : ''}$${month.pnl.toFixed(2)} (${month.winRate.toFixed(1)}% WR over ${month.total} trades)`}
+                      >
+                        <span className="text-[10px] font-black text-zinc-100">{month.name[0]}</span>
+                      </div>
+                      <div className="text-center">
+                        <div className={cn("text-[8px] font-mono font-bold", month.pnl >= 0 ? "text-emerald-500" : "text-rose-500")}>
+                          {month.pnl >= 0 ? '+' : ''}{Math.round(month.pnl)}
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* Time of Day Performance */}
         <div className="crypto-card p-6">
@@ -6193,7 +5861,46 @@ const StatsTab = ({ trades, startingBalance, balanceHistory, dailyGoals, onUpdat
             * 20 simulated paths projecting 30 trades into the future based on your historical performance.
           </p>
         </div>
+        </div>
       </div>
+      )}
+      {/* Update Balance Modal */}
+      {isUpdateBalanceOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-zinc-950/80 backdrop-blur-sm">
+          <div className="bg-zinc-900 border border-zinc-800 rounded-2xl w-full max-w-md shadow-2xl">
+            <div className="p-6 border-b border-zinc-800 flex items-center justify-between">
+              <h2 className="text-xl font-bold">Update Balance</h2>
+              <button onClick={() => setIsUpdateBalanceOpen(false)} className="text-zinc-500 hover:text-zinc-100">
+                <RefreshCw className="w-5 h-5 rotate-45" />
+              </button>
+            </div>
+            <div className="p-6 space-y-4">
+              <div className="space-y-2">
+                <label className="text-xs font-semibold text-zinc-500 uppercase">New Balance (USDT)</label>
+                <input 
+                  type="number"
+                  value={newBalanceValue}
+                  onChange={(e) => setNewBalanceValue(Number(e.target.value))}
+                  className="input-field w-full text-xl font-mono"
+                />
+              </div>
+              <div className="space-y-2">
+                <label className="text-xs font-semibold text-zinc-500 uppercase">Note</label>
+                <input 
+                  value={balanceNote}
+                  onChange={(e) => setBalanceNote(e.target.value)}
+                  className="input-field w-full"
+                  placeholder="Deposit, Withdrawal, Correction..."
+                />
+              </div>
+              <div className="flex gap-4 pt-4">
+                <button onClick={() => setIsUpdateBalanceOpen(false)} className="btn-secondary flex-1">Cancel</button>
+                <button onClick={handleUpdateBalance} className="btn-primary flex-1">Update Balance</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

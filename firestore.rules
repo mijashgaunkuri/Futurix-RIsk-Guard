@@ -54,6 +54,12 @@ service cloud.firestore {
       return isAuthenticated() && request.auth.uid == userId;
     }
 
+    function isAdmin() {
+      return isAuthenticated() && 
+             (get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin' ||
+              (request.auth.token.email == "mijashchhetri1011@gmail.com" && request.auth.token.email_verified == true));
+    }
+
     function isValidUser(data) {
       return data.keys().hasAll(['uid', 'email', 'displayName', 'startingBalance', 'currentBalance', 'createdAt', 'role', 'lastResetMonth']) &&
              data.uid is string &&
@@ -61,7 +67,8 @@ service cloud.firestore {
              data.displayName is string &&
              data.startingBalance is number &&
              data.currentBalance is number &&
-             data.role == 'user';
+             data.role in ['user', 'admin'] &&
+             (!('dailyGoals' in data) || data.dailyGoals is map);
     }
 
     function isValidTrade(data) {
@@ -81,7 +88,7 @@ service cloud.firestore {
              data.id is string &&
              data.date is string &&
              data.amount is number &&
-             data.type in ['DEPOSIT', 'WITHDRAWAL', 'TRADE', 'RESET'] &&
+             data.type in ['DEPOSIT', 'WITHDRAWAL', 'TRADE', 'RESET', 'SET'] &&
              data.balanceAfter is number;
     }
 
@@ -90,22 +97,22 @@ service cloud.firestore {
     // ===============================================================
 
     match /users/{userId} {
-      allow read: if isOwner(userId);
+      allow read: if isOwner(userId) || isAdmin();
       allow create: if isOwner(userId) && isValidUser(request.resource.data);
-      allow update: if isOwner(userId) && isValidUser(request.resource.data);
+      allow update: if (isOwner(userId) || isAdmin()) && isValidUser(request.resource.data);
       
       match /trades/{tradeId} {
-        allow read: if isOwner(userId);
+        allow read: if isOwner(userId) || isAdmin();
         allow create: if isOwner(userId) && isValidTrade(request.resource.data);
         allow update: if isOwner(userId) && isValidTrade(request.resource.data);
-        allow delete: if isOwner(userId);
+        allow delete: if isOwner(userId) || isAdmin();
       }
 
       match /balanceHistory/{historyId} {
-        allow read: if isOwner(userId);
+        allow read: if isOwner(userId) || isAdmin();
         allow create: if isOwner(userId) && isValidHistory(request.resource.data);
         allow update: if isOwner(userId) && isValidHistory(request.resource.data);
-        allow delete: if isOwner(userId);
+        allow delete: if isOwner(userId) || isAdmin();
       }
     }
 

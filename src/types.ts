@@ -79,7 +79,7 @@ export interface BalanceHistory {
   id: string;
   date: string;
   amount: number;
-  type: 'DEPOSIT' | 'WITHDRAWAL' | 'TRADE' | 'RESET';
+  type: 'DEPOSIT' | 'WITHDRAWAL' | 'TRADE' | 'RESET' | 'SET';
   note: string;
   balanceAfter: number;
 }
