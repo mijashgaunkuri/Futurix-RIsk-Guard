@@ -96,6 +96,7 @@ import {
   orderBy, 
   writeBatch,
   deleteDoc,
+  updateDoc,
   getDocFromServer
 } from 'firebase/firestore';
 
@@ -379,6 +380,7 @@ export default function App() {
   const [balanceHistory, setBalanceHistory] = useState<BalanceHistory[]>([]);
   const [currentBalance, setCurrentBalance] = useState<number>(0);
   const [startingBalance, setStartingBalance] = useState<number>(0);
+  const [drawdownResetDate, setDrawdownResetDate] = useState<string | null>(null);
   const [nprRate, setNprRate] = useState<number>(134); // Fallback rate
   const [user, setUser] = useState<FirebaseUser | null>(null);
   const [isAuthReady, setIsAuthReady] = useState(false);
@@ -456,6 +458,7 @@ export default function App() {
         }
 
         setStartingBalance(sBalance);
+        setDrawdownResetDate(data.drawdownResetDate || null);
         setCurrentBalance(data.currentBalance || 0);
         if (data.dailyGoals) {
           setDailyGoals(data.dailyGoals);
@@ -508,15 +511,27 @@ export default function App() {
   useEffect(() => {
     const fetchNprRate = async () => {
       try {
+        // Try Primary API
         const res = await fetch('https://open.er-api.com/v6/latest/USD');
-        if (!res.ok) throw new Error('Network response was not ok');
-        const data = await res.json();
-        if (data.rates && data.rates.NPR) {
-          setNprRate(data.rates.NPR);
+        if (res.ok) {
+          const data = await res.json();
+          if (data.rates && data.rates.NPR) {
+            setNprRate(data.rates.NPR);
+            return;
+          }
+        }
+        
+        // Try Secondary API if primary fails
+        const res2 = await fetch('https://api.exchangerate-api.com/v4/latest/USD');
+        if (res2.ok) {
+          const data2 = await res2.json();
+          if (data2.rates && data2.rates.NPR) {
+            setNprRate(data2.rates.NPR);
+            return;
+          }
         }
       } catch (e) {
-        console.error("Failed to fetch NPR rate", e);
-        // Fallback to a reasonable default if fetch fails
+        // Silent fallback to avoid console noise for non-critical environment-related fetch failures
         setNprRate(134);
       }
     };
@@ -870,11 +885,25 @@ export default function App() {
           batch.delete(doc(db, 'users', user.uid, 'balanceHistory', history.id));
         });
         batch.update(doc(db, 'users', user.uid), {
-          startingBalance: currentBalance
+          startingBalance: currentBalance,
+          drawdownResetDate: null
         });
         await batch.commit();
       } catch (error) {
         handleFirestoreError(error, OperationType.DELETE, `users/${user.uid}/balanceHistory`);
+      }
+    }
+  };
+
+  const resetDrawdown = async () => {
+    if (!user) return;
+    if (window.confirm('Reset Max Drawdown? This will start tracking drawdown from your current balance without deleting history.')) {
+      try {
+        await updateDoc(doc(db, 'users', user.uid), {
+          drawdownResetDate: new Date().toISOString()
+        });
+      } catch (error) {
+        handleFirestoreError(error, OperationType.UPDATE, `users/${user.uid}`);
       }
     }
   };
@@ -1093,6 +1122,7 @@ export default function App() {
             trades={trades} 
             balanceHistory={balanceHistory}
             startingBalance={startingBalance}
+            drawdownResetDate={drawdownResetDate}
             currentBalance={currentBalance}
             onUpdateBalance={updateBalance}
             dailyGoals={dailyGoals}
@@ -1100,6 +1130,7 @@ export default function App() {
             onResetAll={clearData}
             onClearTrades={clearTrades}
             onClearHistory={clearHistory}
+            onResetDrawdown={resetDrawdown}
           />
         )}
       </main>
@@ -1696,22 +1727,39 @@ Return a JSON object with trade details and the ICT analysis. Strictly avoid "gu
     if (!symbol) return;
     setIsFetching(true);
     try {
+      // Try Futures API first
       const res = await fetch(`https://fapi.binance.com/fapi/v1/ticker/price?symbol=${symbol.toUpperCase()}`);
-      if (!res.ok) throw new Error('Binance API response not ok');
-      const data = await res.json();
-      if (data.price) {
-        setEntryPrice(parseFloat(data.price));
+      if (res.ok) {
+        const data = await res.json();
+        if (data.price) {
+          setEntryPrice(parseFloat(data.price));
+          return;
+        }
+      }
+
+      // Try Spot API
+      const res2 = await fetch(`https://api.binance.com/api/v3/ticker/price?symbol=${symbol.toUpperCase()}`);
+      if (res2.ok) {
+        const data2 = await res2.json();
+        if (data2.price) {
+          setEntryPrice(parseFloat(data2.price));
+          return;
+        }
+      }
+      
+      // Try CoinCap as a fallback (often better CORS support)
+      const res3 = await fetch(`https://api.coincap.io/v2/assets?search=${symbol.toUpperCase()}`);
+      if (res3.ok) {
+        const data3 = await res3.json();
+        const asset = data3.data?.find((a: any) => a.symbol === symbol.toUpperCase());
+        if (asset?.priceUsd) {
+          setEntryPrice(parseFloat(asset.priceUsd));
+          return;
+        }
       }
     } catch (e) {
-      console.error("Failed to fetch price", e);
-      // Try a different public API if Binance fails
-      try {
-        const res = await fetch(`https://api.binance.com/api/v3/ticker/price?symbol=${symbol.toUpperCase()}`);
-        const data = await res.json();
-        if (data.price) setEntryPrice(parseFloat(data.price));
-      } catch (innerE) {
-        console.error("All price fetch attempts failed", innerE);
-      }
+      // Silent error handling for the user to avoid console noise
+      // This is often due to CORS restrictions in the preview environment
     } finally {
       setIsFetching(false);
     }
@@ -4905,6 +4953,7 @@ const JournalTab = ({
 const StatsTab = ({ 
   trades, 
   startingBalance, 
+  drawdownResetDate,
   balanceHistory, 
   currentBalance,
   onUpdateBalance,
@@ -4912,7 +4961,8 @@ const StatsTab = ({
   onUpdateDailyGoals, 
   onResetAll, 
   onClearTrades, 
-  onClearHistory 
+  onClearHistory,
+  onResetDrawdown
 }: any) => {
   const [isEditingGoals, setIsEditingGoals] = useState(false);
   const [tempGoals, setTempGoals] = useState(dailyGoals);
@@ -5111,12 +5161,26 @@ const StatsTab = ({
     let maxDrawdownPercent = 0;
     let currentDrawdown = 0;
     let currentDrawdownPercent = 0;
-    let peak = startingBalance;
     
     const sortedHistory = [...balanceHistory].sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
+    
+    // Filter history for drawdown calculation if reset date exists
+    const drawdownHistory = drawdownResetDate 
+      ? sortedHistory.filter(h => new Date(h.date) >= new Date(drawdownResetDate))
+      : sortedHistory;
+
+    // Determine starting peak for the drawdown period
+    let peak = startingBalance;
+    if (drawdownResetDate) {
+      const historyBefore = sortedHistory.filter(h => new Date(h.date) < new Date(drawdownResetDate));
+      if (historyBefore.length > 0) {
+        peak = historyBefore[historyBefore.length - 1].balanceAfter;
+      }
+    }
+    
     const drawdownData: any[] = [];
     
-    sortedHistory.forEach((h) => {
+    drawdownHistory.forEach((h) => {
       if (h.balanceAfter > peak) {
         peak = h.balanceAfter;
       }
@@ -5141,7 +5205,7 @@ const StatsTab = ({
       .sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime())
       .map((h, i) => ({
         name: format(new Date(h.date), 'MMM dd'),
-        balance: h.amount,
+        balance: h.balanceAfter,
         tradeIndex: i
       }));
 
@@ -5175,6 +5239,14 @@ const StatsTab = ({
       dailyHeatmap,
       weeklyHeatmap,
       monthlyHeatmap,
+      kellyCriterion: (() => {
+        if (closed.length === 0) return 0;
+        const w = winRate / 100;
+        const r = avgWin / (avgLoss || 1);
+        if (r === 0) return 0;
+        const k = w - ((1 - w) / r);
+        return Math.max(0, k * 100); // Return as percentage, min 0
+      })(),
       insights: (() => {
         if (closed.length === 0) return null;
         const strategies: Record<string, { wins: number, total: number }> = {};
@@ -5192,7 +5264,7 @@ const StatsTab = ({
         };
       })()
     };
-  }, [trades, startingBalance, balanceHistory]);
+  }, [trades, startingBalance, balanceHistory, drawdownResetDate]);
 
   const handleUpdateBalance = () => {
     onUpdateBalance(newBalanceValue, 'SET', balanceNote || 'Manual Balance Update');
@@ -5487,10 +5559,10 @@ const StatsTab = ({
             <span className="text-[10px] text-zinc-500 uppercase font-bold tracking-wider">Win Rate</span>
             <button 
               onClick={onClearTrades}
-              className="p-1 rounded-md bg-zinc-800/50 hover:bg-rose-500/10 text-zinc-500 hover:text-rose-500 transition-all border border-zinc-700/50"
-              title="Reset Win Rate (Clears Trades)"
+              className="p-1 rounded-md bg-zinc-800/50 hover:bg-emerald-500/10 text-zinc-500 hover:text-emerald-500 transition-all border border-zinc-700/50"
+              title="Edit Win Rate (Clears Trades)"
             >
-              <RefreshCw className="w-3 h-3" />
+              <Edit3 className="w-3 h-3" />
             </button>
           </div>
           <div className="text-2xl font-mono font-bold text-emerald-500 mt-1">{stats.winRate.toFixed(1)}%</div>
@@ -5501,10 +5573,10 @@ const StatsTab = ({
             <span className="text-[10px] text-zinc-500 uppercase font-bold tracking-wider">Profit Factor</span>
             <button 
               onClick={onClearTrades}
-              className="p-1 rounded-md bg-zinc-800/50 hover:bg-rose-500/10 text-zinc-500 hover:text-rose-500 transition-all border border-zinc-700/50"
-              title="Reset Profit Factor (Clears Trades)"
+              className="p-1 rounded-md bg-zinc-800/50 hover:bg-blue-500/10 text-zinc-500 hover:text-blue-500 transition-all border border-zinc-700/50"
+              title="Edit Profit Factor (Clears Trades)"
             >
-              <RefreshCw className="w-3 h-3" />
+              <Edit3 className="w-3 h-3" />
             </button>
           </div>
           <div className="text-2xl font-mono font-bold text-blue-500 mt-1">{stats.profitFactor.toFixed(2)}</div>
@@ -5515,10 +5587,10 @@ const StatsTab = ({
             <span className="text-[10px] text-zinc-500 uppercase font-bold tracking-wider">Total Net PNL</span>
             <button 
               onClick={onClearTrades}
-              className="p-1 rounded-md bg-zinc-800/50 hover:bg-rose-500/10 text-zinc-500 hover:text-rose-500 transition-all border border-zinc-700/50"
-              title="Reset PNL (Clears Trades)"
+              className="p-1 rounded-md bg-zinc-800/50 hover:bg-emerald-500/10 text-zinc-500 hover:text-emerald-500 transition-all border border-zinc-700/50"
+              title="Edit PNL (Clears Trades)"
             >
-              <RefreshCw className="w-3 h-3" />
+              <Edit3 className="w-3 h-3" />
             </button>
           </div>
           <div className={cn("text-2xl font-mono font-bold mt-1", stats.totalNetPnl >= 0 ? "text-emerald-500" : "text-rose-500")}>
@@ -5545,21 +5617,30 @@ const StatsTab = ({
         <div className="crypto-card relative">
           <div className="flex justify-between items-start">
             <span className="text-[10px] text-zinc-500 uppercase font-bold tracking-wider">Max Drawdown</span>
-            <button 
-              onClick={onClearHistory}
-              className="p-1 rounded-md bg-zinc-800/50 hover:bg-rose-500/10 text-zinc-500 hover:text-rose-500 transition-all border border-zinc-700/50"
-              title="Reset Drawdown (Clears History)"
-            >
-              <RefreshCw className="w-3 h-3" />
-            </button>
+            <div className="flex gap-1">
+              <button 
+                onClick={onResetDrawdown}
+                className="p-1 rounded-md bg-zinc-800/50 hover:bg-emerald-500/10 text-zinc-500 hover:text-emerald-500 transition-all border border-zinc-700/50"
+                title="Reset Max Drawdown (Keep History)"
+              >
+                <RefreshCw className="w-3 h-3" />
+              </button>
+              <button 
+                onClick={onClearHistory}
+                className="p-1 rounded-md bg-zinc-800/50 hover:bg-rose-500/10 text-zinc-500 hover:text-rose-500 transition-all border border-zinc-700/50"
+                title="Clear Balance History (Delete Data)"
+              >
+                <Trash2 className="w-3 h-3" />
+              </button>
+            </div>
           </div>
           <div className="text-2xl font-mono font-bold text-rose-500 mt-1">{stats.maxDrawdownPercent.toFixed(1)}%</div>
           <div className="text-[10px] text-zinc-500 mt-1">Current: {stats.currentDrawdownPercent.toFixed(1)}%</div>
         </div>
         <div className="crypto-card">
-          <span className="text-[10px] text-zinc-500 uppercase font-bold tracking-wider">Total Funding</span>
-          <div className="text-2xl font-mono font-bold text-amber-500 mt-1">-${stats.totalFundingFees.toFixed(2)}</div>
-          <div className="text-[10px] text-zinc-500 mt-1">{( (stats.totalFundingFees / (stats.totalFees || 1)) * 100 ).toFixed(1)}% of total fees</div>
+          <span className="text-[10px] text-zinc-500 uppercase font-bold tracking-wider">Kelly Criterion</span>
+          <div className="text-2xl font-mono font-bold text-amber-500 mt-1">{stats.kellyCriterion.toFixed(1)}%</div>
+          <div className="text-[10px] text-zinc-500 mt-1">Suggested risk per trade</div>
         </div>
       </div>
 
