@@ -69,6 +69,15 @@ FundingFee = NotionalValue * (FundingRate / 100) * (HoldHours / 8)
 NetPNL = GrossPNL - EntryFee - ExitFee - FundingFee
 ```
 
+### 2.3 AI-Powered ICT Analysis (Scanner)
+The scanner uses Google Gemini 1.5 Flash to perform institutional-grade price action analysis.
+
+#### A. Validation Logic
+- **MSS (Market Structure Shift)**: AI identifies if price has broken a clear swing high/low with aggressive displacement (large candles).
+- **FVG (Fair Value Gap)**: AI detects 3-candle imbalances within the displacement move.
+- **Liquidity Purge**: AI checks if the move originated from a sweep of previous session/daily highs or lows.
+- **Oversold/Overbought**: AI validates if the entry price is within the premium/discount zone of the displacement leg.
+
 ---
 
 ## 3. Trading Journal (Journal Tab)
@@ -105,6 +114,11 @@ Simulates 20 potential future equity paths (30 trades ahead) by randomly samplin
 ### 4.3 Psychological Analysis
 - **Emotion Correlation**: Tracks PNL and Win Rate against emotions (Greed, Fear, FOMO).
 - **Revenge Trading**: Specifically isolates trades marked as "Revenge" to show their total negative impact on the equity curve.
+
+### 4.4 Performance Heatmaps
+- **Daily Heatmap**: Visualizes PNL and trade density over the last 90 days.
+- **Weekly/Monthly Heatmap**: Aggregates performance by Day of Week and Month of Year to identify temporal edge.
+- **Color Scaling**: Uses a bi-directional color scale (Emerald for profit, Rose for loss) with intensity based on the magnitude of the PNL relative to daily goals.
 
 ---
 

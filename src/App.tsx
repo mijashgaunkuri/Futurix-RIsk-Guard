@@ -1212,6 +1212,13 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, t
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [isScanning, setIsScanning] = useState(false);
   const [scanError, setScanError] = useState<string | null>(null);
+  const [ictAnalysis, setIctAnalysis] = useState<{
+    validity: string;
+    mssConfirmed: string;
+    fvgQuality: string;
+    riskReward: string;
+    verdict: string;
+  } | null>(null);
   const [expandedHistoryId, setExpandedHistoryId] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -1274,7 +1281,15 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, t
                 },
               },
               {
-                text: "Extract trade details from this exchange screenshot. Return a JSON object with: symbol (e.g. BTCUSDT), direction (LONG or SHORT), entryPrice (number), stopLoss (number), takeProfit (number). If any field is not found, return null for it.",
+                text: `Act as a Senior ICT Price Action Analyst. Your task is to extract trade details and validate 1-minute (1m) chart entries based on Market Structure Shift (MSS) and Fair Value Gap (FVG) logic.
+
+### Validation Criteria:
+1. MSS Identification: Confirm price has broken a clear swing high/low with aggressive displacement (large candles).
+2. FVG Quality: Identify if a clear 3-candle imbalance (FVG) exists within the displacement move.
+3. Liquidity Context: Check if the move started after sweeping a previous High or Low (Liquidity Purge).
+4. Entry Zone: Validate if price has retraced into the FVG (Oversold/Overbought zone).
+
+Return a JSON object with trade details and the ICT analysis. Strictly avoid "guessing" if the image is blurry. If no clear MSS is visible, mark validity as INVALID.`,
               },
             ],
             config: {
@@ -1287,6 +1302,17 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, t
                   entryPrice: { type: Type.NUMBER },
                   stopLoss: { type: Type.NUMBER },
                   takeProfit: { type: Type.NUMBER },
+                  ictAnalysis: {
+                    type: Type.OBJECT,
+                    properties: {
+                      validity: { type: Type.STRING, enum: ["VALID", "INVALID", "MARGINAL"] },
+                      mssConfirmed: { type: Type.STRING },
+                      fvgQuality: { type: Type.STRING },
+                      riskReward: { type: Type.STRING },
+                      verdict: { type: Type.STRING },
+                    },
+                    required: ["validity", "mssConfirmed", "fvgQuality", "riskReward", "verdict"],
+                  },
                 },
               },
             },
@@ -1301,6 +1327,7 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, t
           if (result.entryPrice) setEntryPrice(result.entryPrice);
           if (result.stopLoss) setStopLoss(result.stopLoss);
           if (result.takeProfit) setTakeProfit(result.takeProfit);
+          if (result.ictAnalysis) setIctAnalysis(result.ictAnalysis);
         } catch (innerError: any) {
           console.error("AI Scanning failed", innerError);
           setScanError("AI failed to parse screenshot. Try a clearer image.");
@@ -2086,6 +2113,50 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, t
                   />
                 </div>
               </div>
+
+              {ictAnalysis && (
+                <div className="mt-4 p-3 rounded-xl bg-zinc-950/50 border border-zinc-800 space-y-2 animate-in fade-in slide-in-from-top-2 duration-300">
+                  <div className="flex items-center justify-between">
+                    <h4 className="text-[10px] font-bold text-zinc-100 uppercase tracking-wider flex items-center gap-1">
+                      <ShieldCheck className="w-3 h-3 text-emerald-500" /> ICT Analysis Result
+                    </h4>
+                    <div className="flex items-center gap-2">
+                      <span className={cn(
+                        "text-[8px] font-black px-2 py-0.5 rounded",
+                        ictAnalysis.validity === 'VALID' ? "bg-emerald-500/10 text-emerald-500" :
+                        ictAnalysis.validity === 'INVALID' ? "bg-rose-500/10 text-rose-500" :
+                        "bg-amber-500/10 text-amber-500"
+                      )}>
+                        {ictAnalysis.validity}
+                      </span>
+                      <button 
+                        onClick={() => setIctAnalysis(null)}
+                        className="text-zinc-600 hover:text-zinc-400"
+                      >
+                        <X className="w-3 h-3" />
+                      </button>
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-1 gap-2">
+                    <div className="space-y-0.5">
+                      <span className="text-[8px] text-zinc-500 uppercase font-bold">MSS Confirmed</span>
+                      <p className="text-[9px] text-zinc-300 leading-tight">{ictAnalysis.mssConfirmed}</p>
+                    </div>
+                    <div className="space-y-0.5">
+                      <span className="text-[8px] text-zinc-500 uppercase font-bold">FVG Quality</span>
+                      <p className="text-[9px] text-zinc-300 leading-tight">{ictAnalysis.fvgQuality}</p>
+                    </div>
+                    <div className="space-y-0.5">
+                      <span className="text-[8px] text-zinc-500 uppercase font-bold">Risk/Reward</span>
+                      <p className="text-[9px] text-zinc-300 leading-tight">{ictAnalysis.riskReward}</p>
+                    </div>
+                    <div className="pt-1 border-t border-zinc-800/50">
+                      <span className="text-[8px] text-zinc-500 uppercase font-bold">Verdict</span>
+                      <p className="text-[9px] text-emerald-500 font-medium italic leading-tight">{ictAnalysis.verdict}</p>
+                    </div>
+                  </div>
+                </div>
+              )}
             </div>
 
             <div className="grid grid-cols-2 gap-4 mt-6">
