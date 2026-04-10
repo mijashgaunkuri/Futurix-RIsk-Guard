@@ -157,6 +157,20 @@ const simulateFundingFee = (params: {
   return totalRate;
 };
 
+const findBracket = (brackets: any[], notional: number) => {
+  if (!brackets || brackets.length === 0) return null;
+  // Brackets from Binance API are usually in a 'brackets' array within the response
+  const list = Array.isArray(brackets) ? brackets : (brackets as any).brackets || [];
+  if (list.length === 0) return null;
+  
+  for (let b of list) {
+    if (notional >= b.notionalFloor && notional < b.notionalCap) {
+      return b;
+    }
+  }
+  return list[list.length - 1]; // highest tier
+};
+
 /**
  * Volatility-Adjusted Risk
  * Reduces position size (risk) when market volatility (ATR) is high.
@@ -380,6 +394,9 @@ export default function App() {
   const [balanceHistory, setBalanceHistory] = useState<BalanceHistory[]>([]);
   const [currentBalance, setCurrentBalance] = useState<number>(0);
   const [startingBalance, setStartingBalance] = useState<number>(0);
+  const [binancePositions, setBinancePositions] = useState<any[]>([]);
+  const [binanceUsedMargin, setBinanceUsedMargin] = useState(0);
+  const [isSyncingBalance, setIsSyncingBalance] = useState(false);
   const [drawdownResetDate, setDrawdownResetDate] = useState<string | null>(null);
   const [nprRate, setNprRate] = useState<number>(134); // Fallback rate
   const [user, setUser] = useState<FirebaseUser | null>(null);
@@ -500,6 +517,9 @@ export default function App() {
       handleFirestoreError(error, OperationType.LIST, `users/${user.uid}/balanceHistory`);
     });
 
+    // Initial balance sync from Binance
+    refreshBinanceBalance();
+
     return () => {
       unsubscribeProfile();
       unsubscribeTrades();
@@ -545,10 +565,13 @@ export default function App() {
   const [editingTrade, setEditingTrade] = useState<Trade | null>(null);
 
   const totalUsedMargin = useMemo(() => {
-    return trades
+    const journalMargin = trades
       .filter(t => t.status === 'OPEN')
       .reduce((sum, t) => sum + t.initialMargin + (t.addedMargin || 0), 0);
-  }, [trades]);
+    
+    // If we have real-time binance margin, use it as the source of truth for "Real" feel
+    return binanceUsedMargin > 0 ? binanceUsedMargin : journalMargin;
+  }, [trades, binanceUsedMargin]);
 
   const updateDailyGoals = async (goals: { 
     maxTradesPerDay: number, 
@@ -908,6 +931,80 @@ export default function App() {
     }
   };
 
+  const refreshBinanceBalance = async () => {
+    if (!user) return;
+    setIsSyncingBalance(true);
+    try {
+      const response = await fetch('/api/binance/balance');
+      const data = await response.json();
+      if (data.error) {
+        // Don't alert on background sync unless keys are missing
+        if (data.error.includes("not configured")) return;
+        throw new Error(data.error);
+      }
+      if (data.usdt !== undefined) {
+        await updateBalance(data.usdt, 'SET', 'Real-time Binance Balance Sync');
+      }
+      if (data.usedMargin !== undefined) {
+        setBinanceUsedMargin(data.usedMargin);
+      }
+      if (data.positions) {
+        setBinancePositions(data.positions);
+      }
+    } catch (error: any) {
+      console.error("Failed to refresh Binance balance:", error);
+    } finally {
+      setIsSyncingBalance(false);
+    }
+  };
+
+  const handleBinanceSync = async () => {
+    if (!user) return;
+    try {
+      const response = await fetch('/api/binance/sync', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' }
+      });
+      const data = await response.json();
+      if (data.error) {
+        throw new Error(data.error);
+      }
+      
+      // Update balance if returned
+      if (data.balance && data.balance.USDT) {
+        await updateBalance(data.balance.USDT, 'SET', 'Binance Sync Balance');
+      }
+      
+      // Save trades to Firestore
+      if (data.trades && data.trades.length > 0) {
+        const batch = writeBatch(db);
+        data.trades.forEach((t: any) => {
+          const tradeRef = doc(collection(db, 'users', user!.uid, 'trades'), t.id);
+          batch.set(tradeRef, {
+            ...t,
+            strategy: 'BINANCE_SYNC',
+            timeframe: 'N/A',
+            notes: 'Synced from Binance',
+            emotion: 'NEUTRAL',
+            tags: ['BINANCE'],
+            marginMode: 'CROSS',
+            addedMargin: 0,
+            plannedRR: 0,
+            riskAmount: 0,
+            initialMargin: 0,
+            maintenanceMargin: 0,
+            liquidationPrice: 0
+          }, { merge: true });
+        });
+        await batch.commit();
+      }
+      
+      alert(data.info || "Sync successful!");
+    } catch (error: any) {
+      alert(`Sync failed: ${error.message}`);
+    }
+  };
+
   const handleSignIn = async () => {
     try {
       await signInWithGoogle();
@@ -979,11 +1076,30 @@ export default function App() {
           
           <div className="flex items-center gap-4">
             <div className="flex flex-col items-end md:hidden">
-              <span className="text-[8px] text-zinc-500 uppercase font-bold tracking-wider">Balance</span>
+              <div className="flex items-center gap-1">
+                <button 
+                  onClick={refreshBinanceBalance}
+                  disabled={isSyncingBalance}
+                  className={cn("text-zinc-500", isSyncingBalance && "animate-spin")}
+                >
+                  <RefreshCw className="w-2 h-2" />
+                </button>
+                <span className="text-[8px] text-zinc-500 uppercase font-bold tracking-wider">Balance</span>
+              </div>
               <span className="text-sm font-mono font-bold text-emerald-500">${currentBalance.toLocaleString(undefined, { maximumFractionDigits: 0 })}</span>
             </div>
             <div className="hidden md:flex flex-col items-end">
-              <span className="text-[10px] text-zinc-500 uppercase font-bold tracking-wider">Available Balance</span>
+              <div className="flex items-center gap-2">
+                <button 
+                  onClick={refreshBinanceBalance}
+                  disabled={isSyncingBalance}
+                  className={cn("p-1 text-zinc-500 hover:text-emerald-500 transition-colors", isSyncingBalance && "animate-spin")}
+                  title="Refresh Binance Balance"
+                >
+                  <RefreshCw className="w-3 h-3" />
+                </button>
+                <span className="text-[10px] text-zinc-500 uppercase font-bold tracking-wider">Available Balance</span>
+              </div>
               <div className="flex flex-col items-end">
                 <span className="text-lg font-mono font-bold text-emerald-500">${currentBalance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
               </div>
@@ -1113,8 +1229,10 @@ export default function App() {
             importData={importData}
             importBinanceCSV={importBinanceCSV}
             clearData={clearData}
+            onBinanceSync={handleBinanceSync}
             setActiveTab={setActiveTab}
             dailyGoals={dailyGoals}
+            binancePositions={binancePositions}
           />
         )}
         {activeTab === 'stats' && (
@@ -1232,6 +1350,12 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, t
   const [avgOrderBookDepth, setAvgOrderBookDepth] = useState(1000000); // Default $1M depth for majors
   const [makerFee, setMakerFee] = useState(0.02); // 0.02% (2026 Standard)
   const [takerFee, setTakerFee] = useState(0.05); // 0.05% (2026 Standard)
+  const [stepSize, setStepSize] = useState(0.001);
+  const [tickSize, setTickSize] = useState(0.1);
+  const [minNotional, setMinNotional] = useState(5);
+  const [quantityPrecision, setQuantityPrecision] = useState(3);
+  const [pricePrecision, setPricePrecision] = useState(2);
+  const [leverageBrackets, setLeverageBrackets] = useState<any[]>([]);
   const [useDiscount, setUseDiscount] = useState(false); // BNB/Referral Discount
   const [entryOrderType, setEntryOrderType] = useState<'MAKER' | 'TAKER'>('TAKER');
   const [exitTpOrderType, setExitTpOrderType] = useState<'MAKER' | 'TAKER'>('TAKER');
@@ -1242,6 +1366,8 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, t
   const [isFetching, setIsFetching] = useState(false);
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [isScanning, setIsScanning] = useState(false);
+  const [isExecuting, setIsExecuting] = useState(false);
+  const [lastSyncedAt, setLastSyncedAt] = useState<Date | null>(null);
   const [scanError, setScanError] = useState<string | null>(null);
   const [ictAnalysis, setIctAnalysis] = useState<{
     validity: string;
@@ -1274,6 +1400,134 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, t
 
   const deleteHistoryItem = (id: string) => {
     setCalculationHistory(prev => prev.filter(item => item.id !== id));
+  };
+
+  const fetchLiveData = async () => {
+    setIsFetching(true);
+    try {
+      // Convert symbol to Binance format (e.g., BTC/USDT)
+      const formattedSymbol = symbol.includes('/') ? symbol : symbol.replace('USDT', '/USDT');
+      const response = await fetch(`/api/binance/symbol-data?symbol=${encodeURIComponent(formattedSymbol)}`);
+      const data = await response.json();
+      
+      if (data.error) throw new Error(data.error);
+
+      setEntryPrice(data.price);
+      setFundingRate(data.fundingRate);
+      setFundingIntervalHours(data.fundingIntervalHours);
+      setMakerFee(data.makerFee);
+      setTakerFee(data.takerFee);
+      setStepSize(data.stepSize);
+      setTickSize(data.tickSize);
+      setMinNotional(data.minNotional);
+      setQuantityPrecision(data.quantityPrecision);
+      setPricePrecision(data.pricePrecision);
+      setLeverageBrackets(data.leverageBrackets);
+      setLastSyncedAt(new Date());
+      
+      // Auto-adjust SL/TP if they are 0
+      if (stopLoss === 0) {
+        const slDist = data.price * 0.01; // Default 1% SL
+        setStopLoss(direction === 'LONG' ? data.price - slDist : data.price + slDist);
+      }
+      
+      alert(`Live data for ${symbol} synced!`);
+    } catch (error: any) {
+      alert(`Failed to fetch live data: ${error.message}`);
+    } finally {
+      setIsFetching(false);
+    }
+  };
+
+  const handleExecuteTrade = async () => {
+    if (!results) return;
+    
+    const confirmMsg = `Are you sure you want to execute this trade on Binance?\n\n` +
+                      `Symbol: ${symbol}\n` +
+                      `Direction: ${direction}\n` +
+                      `Size: ${results.quantity} ${symbol.replace('USDT', '')}\n` +
+                      `Leverage: ${leverage}x\n` +
+                      `Entry: ${entryPrice}\n` +
+                      `SL: ${stopLoss}\n` +
+                      `TP: ${takeProfit || 'None'}`;
+    
+    if (!window.confirm(confirmMsg)) return;
+
+    setIsExecuting(true);
+    try {
+      const formattedSymbol = symbol.includes('/') ? symbol : symbol.replace('USDT', '/USDT');
+      const response = await fetch('/api/binance/execute-trade', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          symbol: formattedSymbol,
+          direction,
+          type: entryOrderType === 'TAKER' ? 'MARKET' : 'LIMIT',
+          entryPrice,
+          quantity: results.quantity,
+          leverage,
+          marginMode,
+          stopLoss,
+          takeProfit
+        })
+      });
+
+      const data = await response.json();
+      if (data.error) throw new Error(data.error);
+
+      alert(data.message);
+      
+      // Log to journal automatically
+      onLogTrade({
+        id: crypto.randomUUID(),
+        date: new Date().toISOString(),
+        symbol,
+        direction,
+        entryPrice,
+        stopLoss,
+        takeProfit,
+        quantity: results.quantity,
+        notionalValue: results.notionalValue,
+        initialMargin: results.initialMargin,
+        maintenanceMargin: results.maintenanceMargin,
+        liquidationPrice: results.liquidationPrice,
+        leverage,
+        status: 'OPEN',
+        pnl: 0,
+        fees: results.entryFee,
+        netPnl: -results.entryFee,
+        strategy: 'Binance Execution',
+        tags: ['API'],
+        notes: `Executed via Calculator API. SL: ${stopLoss}, TP: ${takeProfit}`,
+        plannedRR: results.plannedRR,
+        riskAmount: results.riskAmount,
+        marginMode,
+        addedMargin: 0,
+        balanceBefore: currentBalance,
+        timeframe: '1m',
+        emotion: 'Neutral',
+        entryOrderType,
+        exitTpOrderType,
+        exitSlOrderType,
+        estimatedHoldHours: expectedHoldHours,
+        fundingRatePerInterval: fundingRate,
+        fundingIntervalHours,
+        makerFee,
+        takerFee,
+        atr,
+        avgOrderBookDepth,
+        avgFundingRate,
+        adjustedRiskPercent: results.adjustedRiskPercent,
+        useDiscount,
+        finalLeverageUsed: results.finalLeverage
+      });
+
+    } catch (error: any) {
+      alert(`Execution Failed: ${error.message}`);
+    } finally {
+      setIsExecuting(true); // Keep true for a bit to show success? No, set to false.
+      setIsExecuting(false);
+    }
   };
 
   const loadHistoryItem = (item: any) => {
@@ -1395,6 +1649,13 @@ Return a JSON object with trade details and the ICT analysis. Strictly avoid "gu
 
   const balance = useJournalBalance ? currentBalance : manualBalance;
 
+  const getDecimals = (size: number) => {
+    if (!size || size >= 1) return 2;
+    const s = size.toString();
+    if (s.includes('.')) return s.split('.')[1].length;
+    return 2;
+  };
+
   const results = useMemo(() => {
     if (!entryPrice || !stopLoss || entryPrice === stopLoss) return null;
 
@@ -1477,7 +1738,6 @@ Return a JSON object with trade details and the ICT analysis. Strictly avoid "gu
     const finalStdQuantity = Math.min(rawStandardQuantity, maxQtyBalanceStd, maxQuantityByNotional);
 
     // 7. Round down to contract step size (Binance minimum quantity precision)
-    const stepSize = 0.001;
     const conservativeQuantity = Math.floor(finalConsQuantity / stepSize) * stepSize;
     const standardQuantity = Math.floor(finalStdQuantity / stepSize) * stepSize;
 
@@ -1491,10 +1751,20 @@ Return a JSON object with trade details and the ICT analysis. Strictly avoid "gu
     const conservativeNotionalValue = conservativeQuantity * entryPrice;
 
     // MMR Tier calculation
-    const tiers = SYMBOL_MMR_TIERS[symbol] || SYMBOL_MMR_TIERS['DEFAULT'];
-    const tier = tiers.find(t => notionalValue <= t.bracket) || tiers[tiers.length - 1];
-    const mmr = tier.mmr;
-    const maintenanceAmount = tier.maintenanceAmount;
+    let mmr = 0;
+    let maintenanceAmount = 0;
+    
+    const bracket = findBracket(leverageBrackets, notionalValue);
+    if (bracket) {
+      mmr = Number(bracket.maintMarginRatio);
+      maintenanceAmount = Number(bracket.cum);
+    } else {
+      // Fallback to hardcoded tiers
+      const tiers = SYMBOL_MMR_TIERS[symbol] || SYMBOL_MMR_TIERS['DEFAULT'];
+      const tier = tiers.find(t => notionalValue <= t.bracket) || tiers[tiers.length - 1];
+      mmr = tier.mmr;
+      maintenanceAmount = tier.maintenanceAmount;
+    }
 
     // Initial Margin
     const initialMargin = notionalValue / finalLeverage;
@@ -1508,7 +1778,7 @@ Return a JSON object with trade details and the ICT analysis. Strictly avoid "gu
     const liqFeeRate = takerFee / 100;
     
     // Maintenance Margin Requirement (MMR)
-    const maintenanceMargin = (notionalValue * (mmr + liqFeeRate)) - maintenanceAmount;
+    const maintenanceMargin = (notionalValue * mmr) - maintenanceAmount;
     
     const feeCost = entryFee; // Cost to open
     
@@ -1526,9 +1796,10 @@ Return a JSON object with trade details and the ICT analysis. Strictly avoid "gu
     const marginInPosition = marginMode === 'CROSS' ? balance : initialMargin;
     const totalUnits = quantity;
 
+    // Official Binance Liquidation Formula (Isolated)
     const liquidationPrice = direction === 'LONG'
-      ? (totalUnits > 0 ? (entryPrice * totalUnits - marginInPosition - maintenanceAmount) / (totalUnits * (1 - mmr - liqFeeRate)) : 0)
-      : (totalUnits > 0 ? (entryPrice * totalUnits + marginInPosition + maintenanceAmount) / (totalUnits * (1 + mmr + liqFeeRate)) : 0);
+      ? (entryPrice * (1 - (1/finalLeverage) + (maintenanceMargin / notionalValue)))
+      : (entryPrice * (1 + (1/finalLeverage) - (maintenanceMargin / notionalValue)));
 
     // Simple Liquidation
     const simpleLiq = direction === 'LONG'
@@ -1719,9 +1990,12 @@ Return a JSON object with trade details and the ICT analysis. Strictly avoid "gu
       avgFundingRate,
       fundingIntervalHours,
       makerFee,
-      takerFee
+      takerFee,
+      stepSize,
+      tickSize,
+      leverageBrackets
     };
-   }, [balance, riskPercent, entryPrice, stopLoss, takeProfit, leverage, direction, symbol, expectedHoldHours, fundingRate, avgFundingRate, makerFee, takerFee, entryOrderType, exitTpOrderType, exitSlOrderType, marginMode, useConservativeSizing, useDiscount, fundingIntervalHours, manualBalance, useJournalBalance, currentBalance, atr, avgOrderBookDepth]);
+   }, [balance, riskPercent, entryPrice, stopLoss, takeProfit, leverage, direction, symbol, expectedHoldHours, fundingRate, avgFundingRate, makerFee, takerFee, entryOrderType, exitTpOrderType, exitSlOrderType, marginMode, useConservativeSizing, useDiscount, fundingIntervalHours, manualBalance, useJournalBalance, currentBalance, atr, avgOrderBookDepth, stepSize, tickSize, leverageBrackets]);
 
   const fetchPrice = async () => {
     if (!symbol) return;
@@ -1836,17 +2110,31 @@ Return a JSON object with trade details and the ICT analysis. Strictly avoid "gu
             <div className="grid grid-cols-2 gap-4">
               <div className="space-y-2">
                 <label className="text-xs font-semibold text-zinc-500 uppercase">Symbol</label>
-                <div className="relative">
-                  <input 
-                    list="symbols"
-                    value={symbol}
-                    onChange={(e) => setSymbol(e.target.value.toUpperCase())}
-                    className="input-field w-full"
-                    placeholder="BTCUSDT"
-                  />
-                  <datalist id="symbols">
-                    {COMMON_SYMBOLS.map(s => <option key={s} value={s} />)}
-                  </datalist>
+                <div className="flex gap-2">
+                  <div className="relative flex-1">
+                    <input 
+                      list="symbols"
+                      value={symbol}
+                      onChange={(e) => setSymbol(e.target.value.toUpperCase())}
+                      className="input-field w-full"
+                      placeholder="BTCUSDT"
+                    />
+                    <datalist id="symbols">
+                      {COMMON_SYMBOLS.map(s => <option key={s} value={s} />)}
+                    </datalist>
+                  </div>
+                  <button 
+                    onClick={fetchLiveData}
+                    disabled={isFetching}
+                    className={cn(
+                      "p-2 rounded-xl border transition-all flex items-center justify-center gap-2",
+                      isFetching ? "bg-zinc-800 border-zinc-700 text-zinc-500" : "bg-emerald-500/10 border-emerald-500/30 text-emerald-500 hover:bg-emerald-500/20"
+                    )}
+                    title="Fetch Live Binance Data"
+                  >
+                    <RefreshCw className={cn("w-4 h-4", isFetching && "animate-spin")} />
+                    <span className="text-[10px] font-bold hidden sm:inline">LIVE</span>
+                  </button>
                 </div>
               </div>
               <div className="space-y-2">
@@ -1924,6 +2212,7 @@ Return a JSON object with trade details and the ICT analysis. Strictly avoid "gu
                 <div className="space-y-2">
                   <label className="text-xs font-semibold text-zinc-500 uppercase flex items-center gap-1">
                     Funding Rate (%)
+                    {lastSyncedAt && <CheckCircle2 className="w-3 h-3 text-emerald-500" title="Synced from Binance" />}
                     <Zap className="w-3 h-3 text-amber-500" />
                   </label>
                   <input 
@@ -1931,7 +2220,7 @@ Return a JSON object with trade details and the ICT analysis. Strictly avoid "gu
                     step="0.001"
                     value={fundingRate}
                     onChange={(e) => setFundingRate(Number(e.target.value))}
-                    className="input-field w-full"
+                    className={cn("input-field w-full", lastSyncedAt && "border-emerald-500/30 text-emerald-500")}
                   />
                 </div>
                 <div className="space-y-2">
@@ -1951,7 +2240,10 @@ Return a JSON object with trade details and the ICT analysis. Strictly avoid "gu
 
               <div className="p-3 rounded-xl bg-zinc-950/30 border border-zinc-800 space-y-3">
                 <div className="flex items-center justify-between">
-                  <label className="text-[10px] font-bold text-zinc-500 uppercase tracking-wider">Fee Settings</label>
+                  <label className="text-[10px] font-bold text-zinc-500 uppercase tracking-wider flex items-center gap-1">
+                    Fee Settings
+                    {lastSyncedAt && <CheckCircle2 className="w-2.5 h-2.5 text-emerald-500" />}
+                  </label>
                   <div className="flex gap-2">
                     <div className="flex items-center gap-1">
                       <span className="text-[9px] text-zinc-600 uppercase">Maker</span>
@@ -1960,7 +2252,7 @@ Return a JSON object with trade details and the ICT analysis. Strictly avoid "gu
                         step="0.001"
                         value={makerFee}
                         onChange={(e) => setMakerFee(Number(e.target.value))}
-                        className="w-12 bg-transparent border-b border-zinc-800 text-[10px] font-mono text-zinc-400 focus:outline-none focus:border-emerald-500"
+                        className={cn("w-12 bg-transparent border-b text-[10px] font-mono focus:outline-none focus:border-emerald-500", lastSyncedAt ? "border-emerald-500/30 text-emerald-500" : "border-zinc-800 text-zinc-400")}
                       />
                     </div>
                     <div className="flex items-center gap-1">
@@ -1970,7 +2262,7 @@ Return a JSON object with trade details and the ICT analysis. Strictly avoid "gu
                         step="0.001"
                         value={takerFee}
                         onChange={(e) => setTakerFee(Number(e.target.value))}
-                        className="w-12 bg-transparent border-b border-zinc-800 text-[10px] font-mono text-zinc-400 focus:outline-none focus:border-emerald-500"
+                        className={cn("w-12 bg-transparent border-b text-[10px] font-mono focus:outline-none focus:border-emerald-500", lastSyncedAt ? "border-emerald-500/30 text-emerald-500" : "border-zinc-800 text-zinc-400")}
                       />
                     </div>
                   </div>
@@ -2428,7 +2720,7 @@ Return a JSON object with trade details and the ICT analysis. Strictly avoid "gu
                   <span className="text-[10px] text-zinc-500 uppercase font-bold block mb-1">Position Quantity</span>
                   <div className="flex items-baseline gap-1">
                     <span className="text-lg font-mono font-bold text-zinc-100">
-                      {results.quantity.toFixed(results.quantity < 0.01 ? 6 : 4)}
+                      {results.quantity.toFixed(getDecimals(results.stepSize))}
                     </span>
                     <span className="text-[10px] text-zinc-600 font-bold">{symbol.replace('USDT', '')}</span>
                   </div>
@@ -2579,13 +2871,13 @@ Return a JSON object with trade details and the ICT analysis. Strictly avoid "gu
                   </div>
                   <span className="text-[10px] text-zinc-500 uppercase font-bold block mb-1">Adv. Liq. Price</span>
                   <div className={cn("text-xl font-mono font-bold", getSafetyColor(results.safetyBuffer))}>
-                    ${results.liquidationPrice.toFixed(results.liquidationPrice < 1 ? 6 : 2)}
+                    ${results.liquidationPrice.toFixed(getDecimals(results.tickSize))}
                   </div>
                   <div className="text-[10px] text-zinc-600 mt-1">MMR-adjusted (isolated). Estimated; triggered by Mark Price.</div>
                 </div>
                 <div className="p-4 rounded-xl bg-rose-500/5 border border-rose-500/20">
                   <span className="text-[10px] text-rose-500/70 uppercase font-bold block mb-1">Bankruptcy Price</span>
-                  <div className="text-lg font-mono font-bold text-rose-400">${results.bankruptcyPrice.toFixed(results.bankruptcyPrice < 1 ? 6 : 2)}</div>
+                  <div className="text-lg font-mono font-bold text-rose-400">${results.bankruptcyPrice.toFixed(getDecimals(results.tickSize))}</div>
                   <div className="text-[10px] text-rose-500/40 mt-1">Loss = full initial margin</div>
                 </div>
               </div>
@@ -2658,6 +2950,33 @@ Return a JSON object with trade details and the ICT analysis. Strictly avoid "gu
                   <span className="text-[10px] text-zinc-500 uppercase font-bold">Effective MMR:</span>
                   <span className="text-xs font-mono font-bold text-amber-500">{results.mmr.toFixed(2)}%</span>
                 </div>
+              </div>
+
+              <div className="mt-6 flex flex-col sm:flex-row gap-3">
+                <button 
+                  onClick={saveToHistory}
+                  className="btn-secondary flex-1 py-3 flex items-center justify-center gap-2"
+                >
+                  <History className="w-4 h-4" />
+                  Save to History
+                </button>
+                <button 
+                  onClick={handleExecuteTrade}
+                  disabled={isExecuting}
+                  className={cn(
+                    "flex-[2] py-3 rounded-xl font-bold transition-all flex items-center justify-center gap-2 shadow-lg shadow-emerald-500/10",
+                    isExecuting 
+                      ? "bg-zinc-800 text-zinc-500 cursor-not-allowed" 
+                      : "bg-emerald-500 text-zinc-950 hover:bg-emerald-400 hover:scale-[1.02] active:scale-[0.98]"
+                  )}
+                >
+                  {isExecuting ? (
+                    <RefreshCw className="w-5 h-5 animate-spin" />
+                  ) : (
+                    <Zap className="w-5 h-5 fill-current" />
+                  )}
+                  {isExecuting ? 'EXECUTING...' : 'EXECUTE TRADE ON BINANCE'}
+                </button>
               </div>
 
               <div className="mt-6 pt-4 border-t border-zinc-800/50">
@@ -4018,7 +4337,9 @@ const JournalTab = ({
   importData, 
   importBinanceCSV,
   clearData,
-  setActiveTab
+  onBinanceSync,
+  setActiveTab,
+  binancePositions
 }: any) => {
   const [search, setSearch] = useState('');
   const [filterDirection, setFilterDirection] = useState<string>('ALL');
@@ -4469,10 +4790,18 @@ const JournalTab = ({
               <label className="btn-secondary p-2 cursor-pointer border-amber-500/30 text-amber-500 hover:bg-amber-500/10" title="Import Binance CSV">
                 <div className="flex items-center gap-1">
                   <FileText className="w-4 h-4" />
-                  <span className="text-[10px] font-bold hidden md:inline">BINANCE</span>
+                  <span className="text-[10px] font-bold hidden md:inline">BINANCE CSV</span>
                 </div>
                 <input type="file" className="hidden" onChange={importBinanceCSV} accept=".csv" />
               </label>
+              <button 
+                onClick={onBinanceSync} 
+                className="btn-secondary p-2 border-amber-500/30 text-amber-500 hover:bg-amber-500/10 flex items-center gap-1" 
+                title="Sync Real-time with Binance API"
+              >
+                <RefreshCw className="w-4 h-4" />
+                <span className="text-[10px] font-bold hidden md:inline">BINANCE SYNC</span>
+              </button>
               <button 
                 onClick={() => setActiveTab('calculator')} 
                 className="btn-secondary p-2 text-blue-500 hover:bg-blue-500/10" 
@@ -4507,6 +4836,57 @@ const JournalTab = ({
           </div>
         )}
       </div>
+
+      {/* Active Binance Positions (Real-time) */}
+      {binancePositions.length > 0 && (
+        <div className="mb-6 space-y-3">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <div className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+              <h3 className="text-xs font-bold uppercase tracking-wider text-zinc-400">Live Binance Positions</h3>
+            </div>
+            <span className="text-[10px] font-mono text-zinc-500">Real-time from API</span>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+            {binancePositions.map((pos, idx) => (
+              <div key={idx} className="crypto-card bg-emerald-500/5 border-emerald-500/20 p-4 relative overflow-hidden group">
+                <div className="absolute top-0 right-0 p-2 opacity-10 group-hover:opacity-20 transition-opacity">
+                  <Activity className="w-12 h-12 text-emerald-500" />
+                </div>
+                <div className="flex justify-between items-start mb-3">
+                  <div>
+                    <div className="text-sm font-bold text-zinc-100">{pos.symbol}</div>
+                    <div className={cn("text-[10px] font-bold uppercase", pos.side === 'long' ? "text-emerald-500" : "text-rose-500")}>
+                      {pos.side} {pos.leverage}x
+                    </div>
+                  </div>
+                  <div className={cn("text-sm font-mono font-bold", pos.unrealizedPnl >= 0 ? "text-emerald-500" : "text-rose-500")}>
+                    {pos.unrealizedPnl >= 0 ? '+' : ''}${Number(pos.unrealizedPnl).toFixed(2)}
+                  </div>
+                </div>
+                <div className="grid grid-cols-2 gap-4 text-[10px]">
+                  <div>
+                    <span className="text-zinc-500 block uppercase">Entry Price</span>
+                    <span className="text-zinc-300 font-mono">${Number(pos.entryPrice).toLocaleString()}</span>
+                  </div>
+                  <div>
+                    <span className="text-zinc-500 block uppercase">Mark Price</span>
+                    <span className="text-zinc-300 font-mono">${Number(pos.markPrice).toLocaleString()}</span>
+                  </div>
+                  <div>
+                    <span className="text-zinc-500 block uppercase">Size</span>
+                    <span className="text-zinc-300 font-mono">{Number(pos.contracts).toFixed(3)}</span>
+                  </div>
+                  <div>
+                    <span className="text-zinc-500 block uppercase">Liq. Price</span>
+                    <span className="text-rose-400 font-mono font-bold">${Number(pos.liquidationPrice).toLocaleString()}</span>
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* Trade List - Mobile Card View */}
       <div className="grid grid-cols-1 gap-4 md:hidden">
@@ -4575,6 +4955,34 @@ const JournalTab = ({
           <div className="text-center py-12 text-zinc-500 text-sm">No trades found.</div>
         )}
       </div>
+
+      {/* Active Binance Positions (Desktop) */}
+      {binancePositions.length > 0 && (
+        <div className="hidden md:block mb-6 space-y-3">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <div className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+              <h3 className="text-xs font-bold uppercase tracking-wider text-zinc-400">Live Binance Positions</h3>
+            </div>
+          </div>
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+            {binancePositions.map((pos, idx) => (
+              <div key={idx} className="crypto-card bg-emerald-500/5 border-emerald-500/20 p-4">
+                <div className="flex justify-between items-start mb-2">
+                  <span className="text-sm font-bold text-zinc-100">{pos.symbol}</span>
+                  <span className={cn("text-xs font-mono font-bold", pos.unrealizedPnl >= 0 ? "text-emerald-500" : "text-rose-500")}>
+                    ${Number(pos.unrealizedPnl).toFixed(2)}
+                  </span>
+                </div>
+                <div className="flex justify-between text-[10px] text-zinc-500">
+                  <span>{pos.side.toUpperCase()} {pos.leverage}x</span>
+                  <span className="text-rose-400 font-bold">Liq: ${Number(pos.liquidationPrice).toLocaleString()}</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* Trade Table (Desktop) */}
       <div className="crypto-card p-0 overflow-hidden border-zinc-800/50 hidden md:block">

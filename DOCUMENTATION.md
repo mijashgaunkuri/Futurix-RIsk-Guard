@@ -1,165 +1,55 @@
-# Barsha Journal & Calculator: Technical Documentation
+# Futurix Trading Journal & Calculator Documentation
 
-## 1. Overview
-Barsha Journal (formerly Futurix Risk Guard) is a professional-grade trading journal and risk management calculator designed for perpetual futures traders. It bridges the gap between theoretical trade planning and real-world execution by accounting for slippage, funding rates, tiered maintenance margins, and psychological factors.
+Welcome to **Futurix**, the ultimate tool for professional crypto traders. This document outlines the advanced features and how to maximize your trading efficiency using the Binance API integration.
 
----
+## 🚀 Core Features
 
-## 2. Risk Calculator (Calculator Tab)
+### 1. Advanced Position Calculator
+The calculator is designed to eliminate guesswork. It uses real-time data to provide professional-grade metrics.
 
-The calculator is the core planning engine. It determines position sizing and liquidation risk based on real-world exchange parameters.
+*   **Auto-Fill (Binance Sync)**: Select any symbol (e.g., BTCUSDT) and hit the **LIVE** button.
+    *   **Market Price**: Fetches current entry price.
+    *   **Funding Rates**: Real-time funding costs for accurate PnL estimation.
+    *   **Fee Rates**: Exact Maker/Taker fees for the specific market.
+    *   **Precision**: Automatically rounds quantities and prices to match Binance's step and tick sizes.
+*   **Volatility-Adjusted Risk**: Automatically suggests risk percentages based on market volatility (ATR).
+*   **Liquidation Engine**: Approximates Binance's maintenance margin tiers to give you a highly accurate liquidation price.
 
-### 2.1 Input Parameters
-- **Symbol**: Selects the asset (BTC, ETH, SOL, etc.). This triggers specific **MMR Tiers** for liquidation calculation.
-- **Account Balance**: The available capital for the trade.
-- **Risk Percentage**: The percentage of the balance to lose if the Stop Loss is hit.
-- **Entry/SL/TP**: Price levels for the trade.
-- **Leverage**: Determines the initial margin required.
-- **Margin Mode**:
-  - **Isolated**: Liquidation is based only on the initial margin allocated.
-  - **Cross**: Liquidation is based on the entire account balance.
-- **Fee Settings**: Configurable Maker (default 0.02%) and Taker (default 0.05%) fees.
-- **Funding Rate**: Estimated funding rate and hold time to project net PNL.
+### 2. One-Click Execution (Biggest Upgrade)
+You can now execute trades directly from the calculator.
 
-### 2.2 Core Logic & Functions
+*   **How it works**: Once you've calculated your perfect position size and risk, hit **EXECUTE TRADE ON BINANCE**.
+*   **What happens**:
+    1.  **Margin Mode**: Automatically sets your preference (Isolated/Cross).
+    2.  **Leverage**: Sets the exact leverage calculated.
+    3.  **Entry Order**: Places your Limit or Market order.
+    4.  **Protection**: Automatically places your **Stop Loss** and **Take Profit** orders simultaneously.
+*   **Benefit**: Zero friction between planning and execution. No more manual entry errors on the exchange.
 
-#### A. Position Sizing (Quantity)
-Calculated based on the risk amount (Balance * Risk%) and the distance to Stop Loss.
-```typescript
-RiskAmount = Balance * (RiskPercent / 100)
-
-// Direction-aware distance
-For Long: DistanceToSL = EntryPrice - StopLoss
-For Short: DistanceToSL = StopLoss - EntryPrice
-
-Quantity = RiskAmount / DistanceToSL
-NotionalValue = Quantity * EntryPrice
-```
-
-#### B. Initial Margin
-```typescript
-InitialMargin = NotionalValue / Leverage
-```
-
-#### C. Liquidation Price (Tiered MMR)
-The calculator uses a **Tiered Maintenance Margin Rate (MMR)** model similar to major exchanges (Binance/Bybit).
-1. **Find Bracket**: The system looks up the `SYMBOL_MMR_TIERS` based on the `NotionalValue`.
-2. **Maintenance Margin (MM)**: `MM = (NotionalValue * MMR) - MaintenanceAmount`.
-3. **Liquidation Fee**: Exchanges often add an estimated taker fee (e.g., 0.05%) to the maintenance requirement.
-   - `LiqFee = NotionalValue * TakerFeeRate`
-4. **Liquidation Formula**:
-   - **Isolated**:
-     - Long: `LiqPrice = (NotionalValue - InitialMargin - MaintenanceAmount + LiqFee) / (Quantity * (1 - MMR))`
-     - Short: `LiqPrice = (NotionalValue + InitialMargin + MaintenanceAmount - LiqFee) / (Quantity * (1 + MMR))`
-   - **Cross**:
-     - Long: `LiqPrice = (NotionalValue - WalletBalance - MaintenanceAmount + LiqFee) / (Quantity * (1 - MMR))`
-     - Short: `LiqPrice = (NotionalValue + WalletBalance + MaintenanceAmount - LiqFee) / (Quantity * (1 + MMR))`
-
-> **Note on Exchange Precision**: Actual exchange liquidation prices may vary slightly due to:
-> - **Mark Price vs Last Price**: Liquidation is typically triggered by the Mark Price, not the Last Traded Price.
-> - **Account-Level MMR**: In Cross mode, liquidation is often dynamic and based on total account equity across all positions.
-> - **Post-Entry Margin**: Adding margin to an isolated position will shift the liquidation price.
-
-#### D. Net PNL Projections
-PNL is calculated net of entry fees, exit fees, and estimated funding costs.
-```typescript
-EntryFee = NotionalValue * EntryFeeRate
-ExitFee = (Quantity * TargetPrice) * ExitFeeRate
-FundingFee = NotionalValue * (FundingRate / 100) * (HoldHours / 8)
-NetPNL = GrossPNL - EntryFee - ExitFee - FundingFee
-```
-
-### 2.3 AI-Powered ICT Analysis (Scanner)
-The scanner uses Google Gemini 1.5 Flash to perform institutional-grade price action analysis.
-
-#### A. Validation Logic
-- **MSS (Market Structure Shift)**: AI identifies if price has broken a clear swing high/low with aggressive displacement (large candles).
-- **FVG (Fair Value Gap)**: AI detects 3-candle imbalances within the displacement move.
-- **Liquidity Purge**: AI checks if the move originated from a sweep of previous session/daily highs or lows.
-- **Oversold/Overbought**: AI validates if the entry price is within the premium/discount zone of the displacement leg.
+### 3. Real-Time Journaling
+*   **Binance Sync**: In the Journal tab, use **BINANCE SYNC** to pull your actual trade history and current balance directly from your account.
+*   **Auto-Logging**: Trades executed via the calculator are automatically logged to your journal for review.
 
 ---
 
-## 3. Trading Journal (Journal Tab)
+## 🛠️ Setup Instructions
 
-The journal tracks execution and manages the lifecycle of a trade.
+To enable the Binance API features, follow these steps:
 
-### 3.1 Trade Lifecycle
-1. **Logging (OPEN)**: When a trade is logged, the `InitialMargin` is "locked" (deducted from Available Balance).
-2. **Updating**: Users can add margin to isolated positions or edit trade details.
-3. **Closing (CLOSED)**: When closed, the system calculates actual PNL, refunds the margin, and updates the balance.
-
-### 3.2 Real-World Friction Tracking
-- **Slippage**: Tracks the difference between `Expected Entry/Exit` and `Actual Entry/Exit`.
-  - `Slippage USDT = (ExpectedPrice - ActualPrice) * Quantity` (adjusted for direction).
-- **MFE/MAE**:
-  - **Maximum Favorable Excursion (MFE)**: The highest profit reached during the trade.
-  - **Maximum Adverse Excursion (MAE)**: The deepest drawdown experienced.
-- **Exit Efficiency**: Captures how much of the total move (Entry to MFE) was captured by the actual exit.
+1.  **API Keys**: Generate an API Key and Secret on Binance (ensure "Futures" permissions are enabled).
+2.  **Settings**: Open the **Settings** menu in Futurix and enter your keys.
+3.  **Environment**: If you are hosting this yourself, add these to your `.env` file:
+    ```env
+    BINANCE_API_KEY=your_key_here
+    BINANCE_API_SECRET=your_secret_here
+    ```
 
 ---
 
-## 4. Advanced Analytics (Stats Tab)
+## 📈 Why This Improves Your Profit
 
-The stats tab provides diagnostic insights into trading behavior and mathematical expectancy.
+1.  **Speed**: Execute complex trades with SL/TP in seconds.
+2.  **Accuracy**: No more "fat-finger" errors or miscalculating position sizes.
+3.  **Psychology**: By planning the trade in the calculator and executing with one click, you stick to your plan and avoid emotional decision-making.
 
-### 4.1 Core Metrics
-- **Profit Factor**: Total Gross Profit / Total Gross Loss.
-- **Expectancy**: The average amount you expect to win (or lose) per trade.
-- **Win Rate by Regime**: Performance breakdown by market condition (Trending vs Ranging).
-
-### 4.2 Monte Carlo Simulation
-Simulates 20 potential future equity paths (30 trades ahead) by randomly sampling from your historical net PNL distribution. This helps visualize the range of outcomes and the risk of a "drawdown streak."
-
-### 4.3 Psychological Analysis
-- **Emotion Correlation**: Tracks PNL and Win Rate against emotions (Greed, Fear, FOMO).
-- **Revenge Trading**: Specifically isolates trades marked as "Revenge" to show their total negative impact on the equity curve.
-
-### 4.4 Performance Heatmaps
-- **Daily Heatmap**: Visualizes PNL and trade density over the last 90 days.
-- **Weekly/Monthly Heatmap**: Aggregates performance by Day of Week and Month of Year to identify temporal edge.
-- **Color Scaling**: Uses a bi-directional color scale (Emerald for profit, Rose for loss) with intensity based on the magnitude of the PNL relative to daily goals.
-
----
-
-## 5. Technical Architecture
-
-### 5.1 Stack
-- **Frontend**: React 18, Vite, TypeScript.
-- **Styling**: Tailwind CSS (Utility-first, dark-themed "Crypto" aesthetic).
-- **Animations**: Framer Motion (Transitions and micro-interactions).
-- **Charts**: Recharts (Responsive SVG charts).
-- **Database**: Firebase Firestore (Real-time sync, persistent storage).
-- **Auth**: Firebase Authentication (Google Login).
-
-### 5.2 Data Structure (Trade Interface)
-```typescript
-interface Trade {
-  id: string;
-  symbol: string;
-  direction: 'LONG' | 'SHORT';
-  entryPrice: number;
-  exitPrice?: number;
-  quantity: number;
-  marginMode: 'ISOLATED' | 'CROSS';
-  netPnl: number;
-  slippagePercent?: number;
-  mfePercent?: number;
-  maePercent?: number;
-  emotion: string;
-  // ... and more
-}
-```
-
-### 5.3 Security & Validation
-- **Firestore Rules**: Implements "Default Deny" with owner-only read/write access.
-- **Balance Integrity**: All balance updates are handled via a central `onUpdateBalance` function to ensure consistency between trade PNL and manual adjustments.
-
----
-
-## 6. Usage Guide
-1. **Plan**: Use the Calculator to find your position size. Ensure the "Liq. Distance" is safe.
-2. **Execute**: Log the trade to the Journal.
-3. **Manage**: If in Isolated mode, use "Add Margin" if the price approaches liquidation.
-4. **Review**: Close the trade with actual prices. Use the "Review" modal to reflect on your psychology and execution efficiency.
-5. **Analyze**: Check the Stats tab weekly to identify leaks in your strategy or mindset.
+**Happy Trading with Futurix!**
