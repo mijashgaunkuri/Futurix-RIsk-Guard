@@ -397,6 +397,20 @@ export default function App() {
   const [binancePositions, setBinancePositions] = useState<any[]>([]);
   const [binanceUsedMargin, setBinanceUsedMargin] = useState(0);
   const [isSyncingBalance, setIsSyncingBalance] = useState(false);
+  const [isSyncingTrades, setIsSyncingTrades] = useState(false);
+  const [notification, setNotification] = useState<{ message: string, type: 'success' | 'error' | 'info' } | null>(null);
+  const [confirmModal, setConfirmModal] = useState<{ 
+    title: string, 
+    message: string, 
+    onConfirm: () => void, 
+    confirmText?: string,
+    type?: 'danger' | 'info'
+  } | null>(null);
+
+  const showNotification = (message: string, type: 'success' | 'error' | 'info' = 'info') => {
+    setNotification({ message, type });
+    setTimeout(() => setNotification(null), 5000);
+  };
   const [drawdownResetDate, setDrawdownResetDate] = useState<string | null>(null);
   const [nprRate, setNprRate] = useState<number>(134); // Fallback rate
   const [user, setUser] = useState<FirebaseUser | null>(null);
@@ -443,6 +457,16 @@ export default function App() {
     return () => unsubscribe();
   }, []);
 
+  // Auto-refresh Binance Balance every 60s
+  useEffect(() => {
+    if (user) {
+      const interval = setInterval(() => {
+        refreshBinanceBalance();
+      }, 60000);
+      return () => clearInterval(interval);
+    }
+  }, [user]);
+
   // Sync User Profile and Data
   useEffect(() => {
     if (!user) {
@@ -452,6 +476,10 @@ export default function App() {
       setStartingBalance(1000);
       return;
     }
+
+    // Initial Binance Sync
+    refreshBinanceBalance();
+    handleBinanceSync();
 
     const userDocRef = doc(db, 'users', user.uid);
     
@@ -750,10 +778,10 @@ export default function App() {
         }
         
         await batch.commit();
-        alert('Data imported and synced to cloud successfully!');
+        showNotification('Data imported and synced to cloud successfully!', 'success');
       } catch (err) {
         console.error("Import error", err);
-        alert('Invalid backup file or sync failed.');
+        showNotification('Invalid backup file or sync failed.', 'error');
       }
     };
     reader.readAsText(file);
@@ -783,7 +811,7 @@ export default function App() {
       const feeIdx = headers.findIndex(h => h.toLowerCase().includes('fee'));
 
       if (dateIdx === -1 || symbolIdx === -1 || priceIdx === -1) {
-        alert("Could not detect required columns (Date, Symbol, Price) in CSV.");
+        showNotification("Could not detect required columns (Date, Symbol, Price) in CSV.", 'error');
         return;
       }
 
@@ -845,13 +873,13 @@ export default function App() {
             batch.set(doc(db, 'users', user.uid, 'trades', t.id), t);
           });
           await batch.commit();
-          alert(`Successfully imported ${trades_to_import.length} trades from Binance CSV!`);
+          showNotification(`Successfully imported ${trades_to_import.length} trades from Binance CSV!`, 'success');
         } catch (err) {
           console.error("CSV Import error", err);
-          alert("Failed to sync imported trades to cloud.");
+          showNotification("Failed to sync imported trades to cloud.", 'error');
         }
       } else {
-        alert("No valid trades found in CSV.");
+        showNotification("No valid trades found in CSV.", 'info');
       }
     };
     reader.readAsText(file);
@@ -859,79 +887,106 @@ export default function App() {
 
   const clearData = async () => {
     if (!user) return;
-    if (window.confirm('Are you sure you want to clear ALL data from the cloud? This cannot be undone.')) {
-      try {
-        const batch = writeBatch(db);
-        
-        trades.forEach(trade => {
-          batch.delete(doc(db, 'users', user.uid, 'trades', trade.id));
-        });
-        
-        balanceHistory.forEach(history => {
-          batch.delete(doc(db, 'users', user.uid, 'balanceHistory', history.id));
-        });
-        
-        batch.update(doc(db, 'users', user.uid), {
-          startingBalance: 1000,
-          currentBalance: 1000
-        });
-        
-        await batch.commit();
-        alert('Cloud data cleared.');
-      } catch (error) {
-        handleFirestoreError(error, OperationType.DELETE, `users/${user.uid}`);
+    setConfirmModal({
+      title: 'Clear All Data',
+      message: 'Are you sure you want to clear ALL data from the cloud? This cannot be undone.',
+      type: 'danger',
+      confirmText: 'Clear All',
+      onConfirm: async () => {
+        try {
+          const batch = writeBatch(db);
+          
+          trades.forEach(trade => {
+            batch.delete(doc(db, 'users', user.uid, 'trades', trade.id));
+          });
+          
+          balanceHistory.forEach(history => {
+            batch.delete(doc(db, 'users', user.uid, 'balanceHistory', history.id));
+          });
+          
+          batch.update(doc(db, 'users', user.uid), {
+            startingBalance: 1000,
+            currentBalance: 1000
+          });
+          
+          await batch.commit();
+          showNotification('Cloud data cleared.', 'success');
+        } catch (error) {
+          handleFirestoreError(error, OperationType.DELETE, `users/${user.uid}`);
+        }
       }
-    }
+    });
   };
 
   const clearTrades = async () => {
     if (!user) return;
-    if (window.confirm('Are you sure you want to clear all trade history? This will reset Win Rate, Profit Factor, and PnL stats.')) {
-      try {
-        const batch = writeBatch(db);
-        trades.forEach(trade => {
-          batch.delete(doc(db, 'users', user.uid, 'trades', trade.id));
-        });
-        await batch.commit();
-      } catch (error) {
-        handleFirestoreError(error, OperationType.DELETE, `users/${user.uid}/trades`);
+    setConfirmModal({
+      title: 'Clear Trade History',
+      message: 'Are you sure you want to clear all trade history? This will reset Win Rate, Profit Factor, and PnL stats.',
+      type: 'danger',
+      confirmText: 'Clear Trades',
+      onConfirm: async () => {
+        try {
+          const batch = writeBatch(db);
+          trades.forEach(trade => {
+            batch.delete(doc(db, 'users', user.uid, 'trades', trade.id));
+          });
+          await batch.commit();
+          showNotification('Trade history cleared.', 'success');
+        } catch (error) {
+          handleFirestoreError(error, OperationType.DELETE, `users/${user.uid}/trades`);
+        }
       }
-    }
+    });
   };
 
   const clearHistory = async () => {
     if (!user) return;
-    if (window.confirm('Are you sure you want to clear all balance history? This will reset Drawdown stats.')) {
-      try {
-        const batch = writeBatch(db);
-        balanceHistory.forEach(history => {
-          batch.delete(doc(db, 'users', user.uid, 'balanceHistory', history.id));
-        });
-        batch.update(doc(db, 'users', user.uid), {
-          startingBalance: currentBalance,
-          drawdownResetDate: null
-        });
-        await batch.commit();
-      } catch (error) {
-        handleFirestoreError(error, OperationType.DELETE, `users/${user.uid}/balanceHistory`);
+    setConfirmModal({
+      title: 'Clear Balance History',
+      message: 'Are you sure you want to clear all balance history? This will reset Drawdown stats.',
+      type: 'danger',
+      confirmText: 'Clear History',
+      onConfirm: async () => {
+        try {
+          const batch = writeBatch(db);
+          balanceHistory.forEach(history => {
+            batch.delete(doc(db, 'users', user.uid, 'balanceHistory', history.id));
+          });
+          batch.update(doc(db, 'users', user.uid), {
+            startingBalance: currentBalance,
+            drawdownResetDate: null
+          });
+          await batch.commit();
+          showNotification('Balance history cleared.', 'success');
+        } catch (error) {
+          handleFirestoreError(error, OperationType.DELETE, `users/${user.uid}/balanceHistory`);
+        }
       }
-    }
+    });
   };
 
   const resetDrawdown = async () => {
     if (!user) return;
-    if (window.confirm('Reset Max Drawdown? This will start tracking drawdown from your current balance without deleting history.')) {
-      try {
-        await updateDoc(doc(db, 'users', user.uid), {
-          drawdownResetDate: new Date().toISOString()
-        });
-      } catch (error) {
-        handleFirestoreError(error, OperationType.UPDATE, `users/${user.uid}`);
+    setConfirmModal({
+      title: 'Reset Max Drawdown',
+      message: 'Reset Max Drawdown? This will start tracking drawdown from your current balance without deleting history.',
+      type: 'info',
+      confirmText: 'Reset Drawdown',
+      onConfirm: async () => {
+        try {
+          await updateDoc(doc(db, 'users', user.uid), {
+            drawdownResetDate: new Date().toISOString()
+          });
+          showNotification('Drawdown reset successfully.', 'success');
+        } catch (error) {
+          handleFirestoreError(error, OperationType.UPDATE, `users/${user.uid}`);
+        }
       }
-    }
+    });
   };
 
-  const refreshBinanceBalance = async () => {
+  async function refreshBinanceBalance() {
     if (!user) return;
     setIsSyncingBalance(true);
     try {
@@ -956,10 +1011,11 @@ export default function App() {
     } finally {
       setIsSyncingBalance(false);
     }
-  };
+  }
 
-  const handleBinanceSync = async () => {
+  async function handleBinanceSync() {
     if (!user) return;
+    setIsSyncingTrades(true);
     try {
       const response = await fetch('/api/binance/sync', {
         method: 'POST',
@@ -980,13 +1036,19 @@ export default function App() {
         const batch = writeBatch(db);
         data.trades.forEach((t: any) => {
           const tradeRef = doc(collection(db, 'users', user!.uid, 'trades'), t.id);
+          const fees = t.fees || 0;
+          const pnl = t.pnl || 0;
+          const netPnl = pnl - fees;
+          
           batch.set(tradeRef, {
             ...t,
+            netPnl,
             strategy: 'BINANCE_SYNC',
             timeframe: 'N/A',
             notes: 'Synced from Binance',
             emotion: 'NEUTRAL',
             tags: ['BINANCE'],
+            stopLoss: 0,
             marginMode: 'CROSS',
             addedMargin: 0,
             plannedRR: 0,
@@ -999,11 +1061,13 @@ export default function App() {
         await batch.commit();
       }
       
-      alert(data.info || "Sync successful!");
+      showNotification(data.info || "Sync successful!", 'success');
     } catch (error: any) {
-      alert(`Sync failed: ${error.message}`);
+      showNotification(`Sync failed: ${error.message}`, 'error');
+    } finally {
+      setIsSyncingTrades(false);
     }
-  };
+  }
 
   const handleSignIn = async () => {
     try {
@@ -1086,7 +1150,7 @@ export default function App() {
                 </button>
                 <span className="text-[8px] text-zinc-500 uppercase font-bold tracking-wider">Balance</span>
               </div>
-              <span className="text-sm font-mono font-bold text-emerald-500">${currentBalance.toLocaleString(undefined, { maximumFractionDigits: 0 })}</span>
+              <span className="text-sm font-mono font-bold text-emerald-500">${(currentBalance || 0).toLocaleString(undefined, { maximumFractionDigits: 0 })}</span>
             </div>
             <div className="hidden md:flex flex-col items-end">
               <div className="flex items-center gap-2">
@@ -1101,14 +1165,14 @@ export default function App() {
                 <span className="text-[10px] text-zinc-500 uppercase font-bold tracking-wider">Available Balance</span>
               </div>
               <div className="flex flex-col items-end">
-                <span className="text-lg font-mono font-bold text-emerald-500">${currentBalance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                <span className="text-lg font-mono font-bold text-emerald-500">${(currentBalance || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
               </div>
             </div>
             <div className="w-px h-8 bg-zinc-800 hidden md:block" />
             <div className="hidden md:flex flex-col items-end">
               <span className="text-[10px] text-zinc-500 uppercase font-bold tracking-wider">Used Margin</span>
               <div className="flex flex-col items-end">
-                <span className="text-lg font-mono font-bold text-amber-500">${totalUsedMargin.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                <span className="text-lg font-mono font-bold text-amber-500">${(totalUsedMargin || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
               </div>
             </div>
             <div className="w-px h-8 bg-zinc-800 hidden md:block" />
@@ -1210,6 +1274,7 @@ export default function App() {
             trades={trades}
             calculationHistory={calculationHistory}
             setCalculationHistory={setCalculationHistory}
+            showNotification={showNotification}
           />
         )}
         {activeTab === 'journal' && (
@@ -1230,9 +1295,12 @@ export default function App() {
             importBinanceCSV={importBinanceCSV}
             clearData={clearData}
             onBinanceSync={handleBinanceSync}
+            isSyncing={isSyncingTrades}
             setActiveTab={setActiveTab}
             dailyGoals={dailyGoals}
             binancePositions={binancePositions}
+            showNotification={showNotification}
+            onLogTrade={handleLogTrade}
           />
         )}
         {activeTab === 'stats' && (
@@ -1252,6 +1320,61 @@ export default function App() {
           />
         )}
       </main>
+
+      {/* Generic Confirm Modal */}
+      {confirmModal && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-zinc-950/90 backdrop-blur-sm animate-in fade-in duration-200">
+          <div className="bg-zinc-900 border border-zinc-800 rounded-3xl w-full max-w-md overflow-hidden shadow-2xl">
+            <div className="p-6 border-b border-zinc-800 flex justify-between items-center">
+              <h2 className="text-xl font-bold">{confirmModal.title}</h2>
+              <button onClick={() => setConfirmModal(null)} className="p-2 hover:bg-zinc-800 rounded-full transition-colors">
+                <Plus className="w-5 h-5 rotate-45" />
+              </button>
+            </div>
+            <div className="p-6">
+              <p className="text-zinc-400 leading-relaxed">{confirmModal.message}</p>
+            </div>
+            <div className="p-6 bg-zinc-950/50 flex gap-3">
+              <button 
+                onClick={() => setConfirmModal(null)}
+                className="flex-1 py-3 rounded-xl font-bold text-zinc-400 hover:bg-zinc-800 transition-all"
+              >
+                Cancel
+              </button>
+              <button 
+                onClick={() => {
+                  confirmModal.onConfirm();
+                  setConfirmModal(null);
+                }}
+                className={cn(
+                  "flex-1 py-3 rounded-xl font-bold transition-all",
+                  confirmModal.type === 'danger' ? "bg-rose-600 text-white hover:bg-rose-500" : "bg-emerald-500 text-zinc-950 hover:bg-emerald-400"
+                )}
+              >
+                {confirmModal.confirmText || 'Confirm'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Notification */}
+      {notification && (
+        <div className={cn(
+          "fixed bottom-24 left-1/2 -translate-x-1/2 z-50 px-6 py-3 rounded-full shadow-2xl flex items-center gap-3 animate-in fade-in slide-in-from-bottom-4",
+          notification.type === 'success' ? "bg-emerald-500 text-zinc-950" : 
+          notification.type === 'error' ? "bg-rose-500 text-zinc-100" : 
+          "bg-blue-500 text-zinc-100"
+        )}>
+          {notification.type === 'success' ? <CheckCircle2 className="w-5 h-5" /> : 
+           notification.type === 'error' ? <AlertTriangle className="w-5 h-5" /> : 
+           <Info className="w-5 h-5" />}
+          <span className="text-sm font-bold">{notification.message}</span>
+          <button onClick={() => setNotification(null)} className="ml-2 opacity-50 hover:opacity-100 transition-opacity">
+            <Plus className="w-4 h-4 rotate-45" />
+          </button>
+        </div>
+      )}
 
       {/* Mobile Navigation */}
       <nav className="fixed bottom-0 left-0 right-0 bg-zinc-950 border-t border-zinc-800 md:hidden z-50">
@@ -1289,14 +1412,15 @@ export default function App() {
 }
 
 // Placeholder components to be implemented in next steps
-const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, trades, calculationHistory, setCalculationHistory }: { 
+const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, trades, calculationHistory, setCalculationHistory, showNotification }: { 
   currentBalance: number, 
   onLogTrade: (t: Trade) => void, 
   onUpdateBalance: (a: number, t: 'DEPOSIT' | 'WITHDRAWAL' | 'TRADE' | 'RESET', n: string) => void, 
   nprRate: number, 
   trades: Trade[],
   calculationHistory: any[],
-  setCalculationHistory: React.Dispatch<React.SetStateAction<any[]>>
+  setCalculationHistory: React.Dispatch<React.SetStateAction<any[]>>,
+  showNotification: (m: string, t?: 'success' | 'error' | 'info') => void
 }) => {
   const [direction, setDirection] = useState<TradeDirection>(() => {
     try {
@@ -1376,8 +1500,18 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, t
     riskReward: string;
     verdict: string;
   } | null>(null);
+  const [isConfirmOpen, setIsConfirmOpen] = useState(false);
   const [expandedHistoryId, setExpandedHistoryId] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (symbol && symbol.length >= 3) {
+      const timer = setTimeout(() => {
+        fetchLiveData();
+      }, 1000); // Debounce 1s
+      return () => clearTimeout(timer);
+    }
+  }, [symbol]);
 
   const saveToHistory = () => {
     if (!results) return;
@@ -1431,9 +1565,9 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, t
         setStopLoss(direction === 'LONG' ? data.price - slDist : data.price + slDist);
       }
       
-      alert(`Live data for ${symbol} synced!`);
+      showNotification(`Live data for ${symbol} synced!`, 'success');
     } catch (error: any) {
-      alert(`Failed to fetch live data: ${error.message}`);
+      showNotification(`Failed to fetch live data: ${error.message}`, 'error');
     } finally {
       setIsFetching(false);
     }
@@ -1442,17 +1576,6 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, t
   const handleExecuteTrade = async () => {
     if (!results) return;
     
-    const confirmMsg = `Are you sure you want to execute this trade on Binance?\n\n` +
-                      `Symbol: ${symbol}\n` +
-                      `Direction: ${direction}\n` +
-                      `Size: ${results.quantity} ${symbol.replace('USDT', '')}\n` +
-                      `Leverage: ${leverage}x\n` +
-                      `Entry: ${entryPrice}\n` +
-                      `SL: ${stopLoss}\n` +
-                      `TP: ${takeProfit || 'None'}`;
-    
-    if (!window.confirm(confirmMsg)) return;
-
     setIsExecuting(true);
     try {
       const formattedSymbol = symbol.includes('/') ? symbol : symbol.replace('USDT', '/USDT');
@@ -1475,7 +1598,7 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, t
       const data = await response.json();
       if (data.error) throw new Error(data.error);
 
-      alert(data.message);
+      showNotification(data.message, 'success');
       
       // Log to journal automatically
       onLogTrade({
@@ -1522,10 +1645,10 @@ const CalculatorTab = ({ currentBalance, onLogTrade, onUpdateBalance, nprRate, t
         finalLeverageUsed: results.finalLeverage
       });
 
+      setIsConfirmOpen(false);
     } catch (error: any) {
-      alert(`Execution Failed: ${error.message}`);
+      showNotification(`Execution Failed: ${error.message}`, 'error');
     } finally {
-      setIsExecuting(true); // Keep true for a bit to show success? No, set to false.
       setIsExecuting(false);
     }
   };
@@ -1789,27 +1912,33 @@ Return a JSON object with trade details and the ICT analysis. Strictly avoid "gu
     const canTakeTrade = totalRequired < balance;
 
     // Bankruptcy Price
-    const bankruptcyPrice = direction === 'LONG' 
-      ? entryPrice - (initialMargin / quantity)
-      : entryPrice + (initialMargin / quantity);
+    const bankruptcyPrice = quantity > 0
+      ? (direction === 'LONG' 
+          ? entryPrice - (initialMargin / quantity)
+          : entryPrice + (initialMargin / quantity))
+      : 0;
 
     const marginInPosition = marginMode === 'CROSS' ? balance : initialMargin;
     const totalUnits = quantity;
 
     // Official Binance Liquidation Formula (Isolated)
-    const liquidationPrice = direction === 'LONG'
-      ? (entryPrice * (1 - (1/finalLeverage) + (maintenanceMargin / notionalValue)))
-      : (entryPrice * (1 + (1/finalLeverage) - (maintenanceMargin / notionalValue)));
+    const liquidationPrice = (notionalValue > 0 && finalLeverage > 0)
+      ? (direction === 'LONG'
+          ? (entryPrice * (1 - (1/finalLeverage) + (maintenanceMargin / notionalValue)))
+          : (entryPrice * (1 + (1/finalLeverage) - (maintenanceMargin / notionalValue))))
+      : 0;
 
     // Simple Liquidation
-    const simpleLiq = direction === 'LONG'
-      ? entryPrice * (1 - 1 / finalLeverage - 0.005)
-      : entryPrice * (1 + 1 / finalLeverage + 0.005);
+    const simpleLiq = finalLeverage > 0
+      ? (direction === 'LONG'
+          ? entryPrice * (1 - 1 / finalLeverage - 0.005)
+          : entryPrice * (1 + 1 / finalLeverage + 0.005))
+      : 0;
 
-    const distToSL = (Math.abs(entryPrice - stopLoss) / entryPrice) * 100;
-    const effectiveSLDist = (effectiveRiskPerContract / entryPrice) * 100;
-    const distToLiq = (Math.abs(entryPrice - liquidationPrice) / entryPrice) * 100;
-    const safetyBuffer = distToLiq / distToSL;
+    const distToSL = entryPrice > 0 ? (Math.abs(entryPrice - stopLoss) / entryPrice) * 100 : 0;
+    const effectiveSLDist = entryPrice > 0 ? (effectiveRiskPerContract / entryPrice) * 100 : 0;
+    const distToLiq = entryPrice > 0 ? (Math.abs(entryPrice - liquidationPrice) / entryPrice) * 100 : 0;
+    const safetyBuffer = distToSL > 0 ? distToLiq / distToSL : 0;
 
     const pnlAtSL = (direction === 'LONG' ? (stopLoss - entryPrice) : (entryPrice - stopLoss)) * quantity;
     const pnlAtTP = takeProfit ? (direction === 'LONG' ? (takeProfit - entryPrice) : (entryPrice - takeProfit)) * quantity : 0;
@@ -2556,7 +2685,7 @@ Return a JSON object with trade details and the ICT analysis. Strictly avoid "gu
                               </span>
                             </div>
                             <div className="text-[10px] text-zinc-500 font-mono">
-                              EP: ${item.entryPrice.toLocaleString()} | Risk: ${item.results?.riskAmount?.toFixed(1) || item.riskAmount?.toFixed(1)} | Profit: ${item.results?.netPnlAtTP?.toFixed(1) || '0.0'}
+                              EP: ${(item.entryPrice || 0).toLocaleString()} | Risk: ${item.results?.riskAmount?.toFixed(1) || item.riskAmount?.toFixed(1)} | Profit: ${item.results?.netPnlAtTP?.toFixed(1) || '0.0'}
                             </div>
                           </div>
                         </div>
@@ -2587,31 +2716,31 @@ Return a JSON object with trade details and the ICT analysis. Strictly avoid "gu
                           <div className="grid grid-cols-2 gap-2 mt-2">
                             <div className="p-2 rounded bg-zinc-950/50 border border-zinc-800/30">
                               <span className="text-[7px] text-zinc-500 uppercase block">Liq. Price</span>
-                              <span className="text-[10px] font-mono font-bold text-rose-400">${item.results.liquidationPrice.toLocaleString()}</span>
+                              <span className="text-[10px] font-mono font-bold text-rose-400">${(item.results?.liquidationPrice || 0).toLocaleString()}</span>
                             </div>
                             <div className="p-2 rounded bg-zinc-950/50 border border-zinc-800/30">
                               <span className="text-[7px] text-zinc-500 uppercase block">Quantity</span>
-                              <span className="text-[10px] font-mono font-bold text-zinc-300">{item.results.quantity.toFixed(4)}</span>
+                              <span className="text-[10px] font-mono font-bold text-zinc-300">{(item.results.quantity || 0).toFixed(4)}</span>
                             </div>
                             <div className="p-2 rounded bg-zinc-950/50 border border-zinc-800/30">
                               <span className="text-[7px] text-zinc-500 uppercase block">Margin</span>
-                              <span className="text-[10px] font-mono font-bold text-zinc-300">${item.results.initialMargin.toFixed(2)}</span>
+                              <span className="text-[10px] font-mono font-bold text-zinc-300">${(item.results.initialMargin || 0).toFixed(2)}</span>
                             </div>
                             <div className="p-2 rounded bg-zinc-950/50 border border-zinc-800/30">
                               <span className="text-[7px] text-zinc-500 uppercase block">Notional</span>
-                              <span className="text-[10px] font-mono font-bold text-zinc-300">${item.results.notionalValue.toFixed(2)}</span>
+                              <span className="text-[10px] font-mono font-bold text-zinc-300">${(item.results.notionalValue || 0).toFixed(2)}</span>
                             </div>
                             <div className="p-2 rounded bg-zinc-950/50 border border-zinc-800/30">
                               <span className="text-[7px] text-zinc-500 uppercase block">Planned RR</span>
-                              <span className="text-[10px] font-mono font-bold text-emerald-500">{item.results.plannedRR.toFixed(2)}:1</span>
+                              <span className="text-[10px] font-mono font-bold text-emerald-500">{(item.results.plannedRR || 0).toFixed(2)}:1</span>
                             </div>
                             <div className="p-2 rounded bg-zinc-950/50 border border-zinc-800/30">
                               <span className="text-[7px] text-zinc-500 uppercase block">Net RR</span>
-                              <span className="text-[10px] font-mono font-bold text-emerald-500">{item.results.netRR.toFixed(2)}:1</span>
+                              <span className="text-[10px] font-mono font-bold text-emerald-500">{(item.results.netRR || 0).toFixed(2)}:1</span>
                             </div>
                             <div className="p-2 rounded bg-zinc-950/50 border border-zinc-800/30">
                               <span className="text-[7px] text-zinc-500 uppercase block">Potential Profit</span>
-                              <span className="text-[10px] font-mono font-bold text-emerald-500">${item.results.netPnlAtTP.toFixed(2)}</span>
+                              <span className="text-[10px] font-mono font-bold text-emerald-500">${(item.results.netPnlAtTP || 0).toFixed(2)}</span>
                             </div>
                             <div className="p-2 rounded bg-zinc-950/50 border border-zinc-800/30">
                               <span className="text-[7px] text-zinc-500 uppercase block">Score</span>
@@ -2731,7 +2860,7 @@ Return a JSON object with trade details and the ICT analysis. Strictly avoid "gu
                 <div className="p-4 rounded-xl bg-emerald-500/5 border border-emerald-500/20">
                   <span className="text-[10px] text-emerald-500/70 uppercase font-bold block mb-1">Active Position (USDT)</span>
                   <div className="text-lg font-mono font-bold text-emerald-500">
-                    ${results.notionalValue.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                    ${(results.notionalValue || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                   </div>
                   <div className="text-[8px] text-zinc-600 uppercase mt-1">Total Notional Value</div>
                 </div>
@@ -2747,20 +2876,20 @@ Return a JSON object with trade details and the ICT analysis. Strictly avoid "gu
                 </div>
                 <div className="p-4 rounded-xl bg-zinc-950/50 border border-zinc-800/50">
                   <span className="text-[10px] text-zinc-500 uppercase font-bold block mb-1">Initial Margin</span>
-                  <div className="text-lg font-mono font-bold text-zinc-100">${results.initialMargin.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
-                  <div className="text-[8px] text-zinc-600 uppercase mt-1">Notional Limit: ${results.maxNotionalLimit.toLocaleString()}</div>
+                  <div className="text-lg font-mono font-bold text-zinc-100">${(results.initialMargin || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
+                  <div className="text-[8px] text-zinc-600 uppercase mt-1">Notional Limit: ${(results.maxNotionalLimit || 0).toLocaleString()}</div>
                 </div>
                 <div className="p-4 rounded-xl bg-blue-500/5 border border-blue-500/20">
                   <span className="text-[10px] text-blue-500/70 uppercase font-bold block mb-1">Risk-to-Reward</span>
-                  <div className={cn("text-lg font-mono font-bold", results.netRR >= 2 ? "text-emerald-500" : "text-amber-500")}>
-                    {results.netRR.toFixed(2)}:1 <span className="text-[10px] text-zinc-600">(Net)</span>
+                  <div className={cn("text-lg font-mono font-bold", (results.netRR || 0) >= 2 ? "text-emerald-500" : "text-amber-500")}>
+                    {(results.netRR || 0).toFixed(2)}:1 <span className="text-[10px] text-zinc-600">(Net)</span>
                   </div>
-                  <div className="text-[8px] text-zinc-600 uppercase mt-1">Planned: {results.plannedRR.toFixed(2)}:1</div>
+                  <div className="text-[8px] text-zinc-600 uppercase mt-1">Planned: {(results.plannedRR || 0).toFixed(2)}:1</div>
                 </div>
                 <div className="p-4 rounded-xl bg-rose-500/5 border border-rose-500/20">
                   <span className="text-[10px] text-rose-500/70 uppercase font-bold block mb-1">Risk Amount (Net Loss)</span>
-                  <div className="text-lg font-mono font-bold text-rose-500">{results.netPnlAtSL.toFixed(2)}</div>
-                  <div className="text-[10px] text-rose-500/40 font-mono">Target: -${results.riskAmount.toFixed(2)} (≈ Rs. {(results.riskAmount * nprRate).toLocaleString()})</div>
+                  <div className="text-lg font-mono font-bold text-rose-500">{(results.netPnlAtSL || 0).toFixed(2)}</div>
+                  <div className="text-[10px] text-rose-500/40 font-mono">Target: -${(results.riskAmount || 0).toFixed(2)} (≈ Rs. {((results.riskAmount || 0) * nprRate).toLocaleString()})</div>
                 </div>
                 <div className={cn(
                   "p-4 rounded-xl border transition-all",
@@ -2768,13 +2897,13 @@ Return a JSON object with trade details and the ICT analysis. Strictly avoid "gu
                 )}>
                   <span className="text-[10px] text-zinc-500 uppercase font-bold block mb-1">Total Required (Margin+Fees)</span>
                   <div className={cn("text-lg font-mono font-bold", !results.canTakeTrade ? "text-rose-500" : "text-zinc-100")}>
-                    ${results.totalRequired.toFixed(2)}
+                    ${(results.totalRequired || 0).toFixed(2)}
                   </div>
                   {!results.canTakeTrade && <div className="text-[10px] text-rose-500 font-bold uppercase mt-1">Insufficient Funds</div>}
                 </div>
                 <div className="p-4 rounded-xl bg-amber-500/5 border border-amber-500/20">
                   <span className="text-[10px] text-amber-500/70 uppercase font-bold block mb-1">Est. Funding Cost</span>
-                  <div className="text-lg font-mono font-bold text-amber-500">${results.fundingFee.toFixed(4)}</div>
+                  <div className="text-lg font-mono font-bold text-amber-500">${(results.fundingFee || 0).toFixed(4)}</div>
                   <div className="text-[10px] text-zinc-600 mt-1">Based on {expectedHoldHours}h hold time</div>
                 </div>
                 <div className="p-4 rounded-xl bg-zinc-950/50 border border-zinc-800/50">
@@ -2810,9 +2939,9 @@ Return a JSON object with trade details and the ICT analysis. Strictly avoid "gu
                   <div className="flex justify-between items-center">
                     <span className="text-[10px] text-zinc-500 uppercase font-bold">Net PNL at SL</span>
                     <div className="text-right">
-                      <div className="text-sm font-mono font-bold text-rose-500">-${Math.abs(results.netPnlAtSL).toFixed(2)}</div>
-                      <div className="text-[10px] text-rose-500/60 font-mono">Incl. ${results.estimatedTotalFees.toFixed(2)} fees</div>
-                      <div className="text-[10px] text-rose-500/40 font-mono">≈ Rs. {(Math.abs(results.netPnlAtSL) * nprRate).toLocaleString()}</div>
+                      <div className="text-sm font-mono font-bold text-rose-500">-${Math.abs(results.netPnlAtSL || 0).toFixed(2)}</div>
+                      <div className="text-[10px] text-rose-500/60 font-mono">Incl. ${(results.estimatedTotalFees || 0).toFixed(2)} fees</div>
+                      <div className="text-[10px] text-rose-500/40 font-mono">≈ Rs. {(Math.abs(results.netPnlAtSL || 0) * nprRate).toLocaleString()}</div>
                     </div>
                   </div>
                 </div>
@@ -2828,9 +2957,9 @@ Return a JSON object with trade details and the ICT analysis. Strictly avoid "gu
                     <div className="flex justify-between items-center">
                       <span className="text-[10px] text-zinc-500 uppercase font-bold">Net PNL at TP</span>
                       <div className="text-right">
-                        <div className="text-sm font-mono font-bold text-emerald-500">+${results.netPnlAtTP.toFixed(2)}</div>
-                        <div className="text-[10px] text-emerald-500/60 font-mono">Incl. ${results.totalTpFriction.toFixed(2)} fees</div>
-                        <div className="text-[10px] text-emerald-500/40 font-mono">≈ Rs. {(results.netPnlAtTP * nprRate).toLocaleString()}</div>
+                        <div className="text-sm font-mono font-bold text-emerald-500">+${(results.netPnlAtTP || 0).toFixed(2)}</div>
+                        <div className="text-[10px] text-emerald-500/60 font-mono">Incl. ${(results.totalTpFriction || 0).toFixed(2)} fees</div>
+                        <div className="text-[10px] text-emerald-500/40 font-mono">≈ Rs. {((results.netPnlAtTP || 0) * nprRate).toLocaleString()}</div>
                       </div>
                     </div>
                   </div>
@@ -2961,7 +3090,7 @@ Return a JSON object with trade details and the ICT analysis. Strictly avoid "gu
                   Save to History
                 </button>
                 <button 
-                  onClick={handleExecuteTrade}
+                  onClick={() => setIsConfirmOpen(true)}
                   disabled={isExecuting}
                   className={cn(
                     "flex-[2] py-3 rounded-xl font-bold transition-all flex items-center justify-center gap-2 shadow-lg shadow-emerald-500/10",
@@ -3087,11 +3216,11 @@ Return a JSON object with trade details and the ICT analysis. Strictly avoid "gu
               <div className="grid grid-cols-2 gap-4">
                 <div className="p-4 bg-zinc-950/50 rounded-xl border border-zinc-800/50 flex flex-col items-center justify-center">
                   <span className="text-[10px] font-bold text-zinc-500 uppercase mb-1">TP 2 (2:1 RR)</span>
-                  <span className="text-xl font-black font-mono text-emerald-500">${results.suggestedTP2.toLocaleString()}</span>
+                  <span className="text-xl font-black font-mono text-emerald-500">${(results.suggestedTP2 || 0).toLocaleString()}</span>
                 </div>
                 <div className="p-4 bg-zinc-950/50 rounded-xl border border-zinc-800/50 flex flex-col items-center justify-center">
                   <span className="text-[10px] font-bold text-zinc-500 uppercase mb-1">TP 3 (3:1 RR)</span>
-                  <span className="text-xl font-black font-mono text-emerald-500">${results.suggestedTP3.toLocaleString()}</span>
+                  <span className="text-xl font-black font-mono text-emerald-500">${(results.suggestedTP3 || 0).toLocaleString()}</span>
                 </div>
               </div>
             </div>
@@ -3133,13 +3262,104 @@ Return a JSON object with trade details and the ICT analysis. Strictly avoid "gu
             onLogTrade(trade);
             setIsModalOpen(false);
           }}
+          showNotification={showNotification}
+        />
+      )}
+
+      {isConfirmOpen && results && (
+        <ConfirmExecutionModal 
+          results={results}
+          symbol={symbol}
+          direction={direction}
+          leverage={leverage}
+          entryPrice={entryPrice}
+          stopLoss={stopLoss}
+          takeProfit={takeProfit}
+          isExecuting={isExecuting}
+          onClose={() => setIsConfirmOpen(false)}
+          onConfirm={handleExecuteTrade}
         />
       )}
     </div>
   );
 };
 
-const LogTradeModal = ({ results, symbol, direction, leverage, entryPrice, stopLoss, takeProfit, currentBalance, onClose, onSave }: any) => {
+const ConfirmExecutionModal = ({ results, symbol, direction, leverage, entryPrice, stopLoss, takeProfit, isExecuting, onClose, onConfirm }: any) => {
+  return (
+    <div className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-zinc-950/90 backdrop-blur-sm animate-in fade-in duration-200">
+      <div className="bg-zinc-900 border border-zinc-800 rounded-3xl w-full max-w-md overflow-hidden shadow-2xl">
+        <div className="p-6 border-b border-zinc-800 flex justify-between items-center">
+          <div className="flex items-center gap-2">
+            <Zap className="w-5 h-5 text-emerald-500 fill-current" />
+            <h2 className="text-xl font-bold">Confirm Execution</h2>
+          </div>
+          <button onClick={onClose} className="p-2 hover:bg-zinc-800 rounded-full transition-colors">
+            <Plus className="w-5 h-5 rotate-45" />
+          </button>
+        </div>
+        
+        <div className="p-6 space-y-6">
+          <div className="bg-zinc-950 rounded-2xl p-4 border border-zinc-800">
+            <div className="flex justify-between items-center mb-4">
+              <span className="text-2xl font-bold font-mono">{symbol}</span>
+              <span className={cn(
+                "px-3 py-1 rounded-full text-xs font-bold uppercase tracking-wider",
+                direction === 'LONG' ? "bg-emerald-500/10 text-emerald-500" : "bg-rose-500/10 text-rose-500"
+              )}>
+                {direction} {leverage}x
+              </span>
+            </div>
+            
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <span className="text-[10px] text-zinc-500 uppercase font-bold block mb-1">Quantity</span>
+                <span className="text-lg font-mono font-bold">{results.quantity}</span>
+              </div>
+              <div>
+                <span className="text-[10px] text-zinc-500 uppercase font-bold block mb-1">Notional</span>
+                <span className="text-lg font-mono font-bold text-emerald-500">${results.notionalValue.toFixed(2)}</span>
+              </div>
+              <div>
+                <span className="text-[10px] text-zinc-500 uppercase font-bold block mb-1">Entry Price</span>
+                <span className="text-lg font-mono font-bold">${(entryPrice || 0).toLocaleString()}</span>
+              </div>
+              <div>
+                <span className="text-[10px] text-zinc-500 uppercase font-bold block mb-1">Stop Loss</span>
+                <span className="text-lg font-mono font-bold text-rose-500">${(stopLoss || 0).toLocaleString()}</span>
+              </div>
+            </div>
+          </div>
+
+          <div className="flex items-start gap-3 p-4 bg-amber-500/5 border border-amber-500/20 rounded-2xl">
+            <AlertTriangle className="w-5 h-5 text-amber-500 shrink-0 mt-0.5" />
+            <p className="text-xs text-amber-200/70 leading-relaxed">
+              This will place a real order on Binance Futures. Ensure your API keys have "Enable Futures" permissions.
+            </p>
+          </div>
+        </div>
+
+        <div className="p-6 bg-zinc-950/50 flex gap-3">
+          <button 
+            onClick={onClose}
+            className="flex-1 py-3 rounded-xl font-bold text-zinc-400 hover:bg-zinc-800 transition-all"
+          >
+            Cancel
+          </button>
+          <button 
+            onClick={onConfirm}
+            disabled={isExecuting}
+            className="flex-[2] py-3 rounded-xl font-bold bg-emerald-500 text-zinc-950 hover:bg-emerald-400 transition-all flex items-center justify-center gap-2"
+          >
+            {isExecuting ? <RefreshCw className="w-5 h-5 animate-spin" /> : <Zap className="w-5 h-5 fill-current" />}
+            {isExecuting ? 'EXECUTING...' : 'CONFIRM & EXECUTE'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+const LogTradeModal = ({ results, symbol, direction, leverage, entryPrice, stopLoss, takeProfit, currentBalance, onClose, onSave, showNotification }: any) => {
   const [expectedEntryPrice, setExpectedEntryPrice] = useState(entryPrice.toString());
   const [strategy, setStrategy] = useState(STRATEGIES[0]);
   const [timeframe, setTimeframe] = useState(TIMEFRAMES[2]);
@@ -3161,7 +3381,7 @@ const LogTradeModal = ({ results, symbol, direction, leverage, entryPrice, stopL
     const file = e.target.files?.[0];
     if (file) {
       if (file.size > 2 * 1024 * 1024) {
-        alert("File size too large. Please upload an image smaller than 2MB.");
+        showNotification("File size too large. Please upload an image smaller than 2MB.", 'error');
         return;
       }
       const reader = new FileReader();
@@ -3462,7 +3682,7 @@ const LogTradeModal = ({ results, symbol, direction, leverage, entryPrice, stopL
   );
 };
 
-const CloseTradeModal = ({ trade, onClose, onSave }: { trade: Trade, onClose: () => void, onSave: (data: Partial<Trade>) => void }) => {
+const CloseTradeModal = ({ trade, onClose, onSave, showNotification }: { trade: Trade, onClose: () => void, onSave: (data: Partial<Trade>) => void, showNotification: any }) => {
   const [exitPrice, setExitPrice] = useState(trade.exitPrice?.toString() || '');
   const [expectedExitPrice, setExpectedExitPrice] = useState(trade.takeProfit?.toString() || '');
   const [fees, setFees] = useState('0.5');
@@ -3565,7 +3785,7 @@ const CloseTradeModal = ({ trade, onClose, onSave }: { trade: Trade, onClose: ()
     const file = e.target.files?.[0];
     if (file) {
       if (file.size > 2 * 1024 * 1024) {
-        alert("File size too large. Please upload an image smaller than 2MB.");
+        showNotification("File size too large. Please upload an image smaller than 2MB.", 'error');
         return;
       }
       const reader = new FileReader();
@@ -3802,7 +4022,7 @@ const CloseTradeModal = ({ trade, onClose, onSave }: { trade: Trade, onClose: ()
   );
 };
 
-const EditTradeModal = ({ trade, onClose, onSave }: { trade: Trade, onClose: () => void, onSave: (updatedTrade: Trade) => void }) => {
+const EditTradeModal = ({ trade, onClose, onSave, showNotification }: { trade: Trade, onClose: () => void, onSave: (updatedTrade: Trade) => void, showNotification: any }) => {
   const [strategy, setStrategy] = useState(trade.strategy);
   const [timeframe, setTimeframe] = useState(trade.timeframe);
   const [notes, setNotes] = useState(trade.notes);
@@ -3844,7 +4064,7 @@ const EditTradeModal = ({ trade, onClose, onSave }: { trade: Trade, onClose: () 
     const file = e.target.files?.[0];
     if (file) {
       if (file.size > 2 * 1024 * 1024) {
-        alert("File size too large. Please upload an image smaller than 2MB.");
+        showNotification("File size too large. Please upload an image smaller than 2MB.", 'error');
         return;
       }
       const reader = new FileReader();
@@ -4338,8 +4558,11 @@ const JournalTab = ({
   importBinanceCSV,
   clearData,
   onBinanceSync,
+  isSyncing,
   setActiveTab,
-  binancePositions
+  binancePositions,
+  showNotification,
+  onLogTrade
 }: any) => {
   const [search, setSearch] = useState('');
   const [filterDirection, setFilterDirection] = useState<string>('ALL');
@@ -4352,11 +4575,33 @@ const JournalTab = ({
   const [closingTrade, setClosingTrade] = useState<Trade | null>(null);
   const [editingPnlTrade, setEditingPnlTrade] = useState<Trade | null>(null);
   const [addingMarginTrade, setAddingMarginTrade] = useState<Trade | null>(null);
+  const [loggingPosition, setLoggingPosition] = useState<any | null>(null);
   const [editedPnl, setEditedPnl] = useState<string>('');
   const [editedFees, setEditedFees] = useState<string>('');
   const [selectedTrades, setSelectedTrades] = useState<string[]>([]);
   const [sortField, setSortField] = useState<keyof Trade>('date');
   const [sortDirection, setSortDirection] = useState<'asc' | 'desc'>('desc');
+
+  const loggingResults = useMemo(() => {
+    if (!loggingPosition) return null;
+    const qty = Math.abs(Number(loggingPosition.contracts));
+    const entry = Number(loggingPosition.entryPrice);
+    const notional = qty * entry;
+    return {
+      finalLeverage: loggingPosition.leverage,
+      quantity: qty,
+      notionalValue: notional,
+      initialMargin: notional / loggingPosition.leverage,
+      maintenanceMargin: 0,
+      liquidationPrice: Number(loggingPosition.liquidationPrice),
+      riskAmount: 0,
+      entryFee: 0,
+      plannedRR: 0,
+      marginMode: (loggingPosition.marginType || 'ISOLATED').toUpperCase(),
+      safetyBuffer: 0,
+      distToLiq: 0,
+    };
+  }, [loggingPosition]);
 
   const filteredTrades = useMemo(() => {
     const filtered = trades.filter((t: Trade) => {
@@ -4392,6 +4637,13 @@ const JournalTab = ({
       setSortField(field);
       setSortDirection('desc');
     }
+  };
+
+  const isPositionLive = (trade: Trade) => {
+    return binancePositions.some((pos: any) => 
+      pos.symbol === trade.symbol && 
+      pos.side.toUpperCase() === trade.direction
+    );
   };
 
   const handleUpdateBalance = () => {
@@ -4433,7 +4685,7 @@ const JournalTab = ({
 
     const rows = trades.map((t: Trade) => [
       t.id,
-      new Date(t.date).toLocaleString(),
+      (new Date(t.date)).toLocaleString(),
       t.symbol,
       t.direction,
       t.strategy,
@@ -4731,6 +4983,7 @@ const JournalTab = ({
           trade={closingTrade}
           onClose={() => setClosingTrade(null)}
           onSave={handleCloseSave}
+          showNotification={showNotification}
         />
       )}
 
@@ -4742,6 +4995,7 @@ const JournalTab = ({
             onUpdateTrade(updatedTrade);
             setEditingTrade(null);
           }}
+          showNotification={showNotification}
         />
       )}
 
@@ -4796,11 +5050,15 @@ const JournalTab = ({
               </label>
               <button 
                 onClick={onBinanceSync} 
-                className="btn-secondary p-2 border-amber-500/30 text-amber-500 hover:bg-amber-500/10 flex items-center gap-1" 
+                disabled={isSyncing}
+                className={cn(
+                  "btn-secondary p-2 border-amber-500/30 text-amber-500 hover:bg-amber-500/10 flex items-center gap-1",
+                  isSyncing && "opacity-50 cursor-not-allowed"
+                )}
                 title="Sync Real-time with Binance API"
               >
-                <RefreshCw className="w-4 h-4" />
-                <span className="text-[10px] font-bold hidden md:inline">BINANCE SYNC</span>
+                <RefreshCw className={cn("w-4 h-4", isSyncing && "animate-spin")} />
+                <span className="text-[10px] font-bold hidden md:inline">{isSyncing ? 'SYNCING...' : 'BINANCE SYNC'}</span>
               </button>
               <button 
                 onClick={() => setActiveTab('calculator')} 
@@ -4855,7 +5113,10 @@ const JournalTab = ({
                 </div>
                 <div className="flex justify-between items-start mb-3">
                   <div>
-                    <div className="text-sm font-bold text-zinc-100">{pos.symbol}</div>
+                    <div className="flex items-center gap-2">
+                      <div className="text-sm font-bold text-zinc-100">{pos.symbol}</div>
+                      <div className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                    </div>
                     <div className={cn("text-[10px] font-bold uppercase", pos.side === 'long' ? "text-emerald-500" : "text-rose-500")}>
                       {pos.side} {pos.leverage}x
                     </div>
@@ -4867,11 +5128,11 @@ const JournalTab = ({
                 <div className="grid grid-cols-2 gap-4 text-[10px]">
                   <div>
                     <span className="text-zinc-500 block uppercase">Entry Price</span>
-                    <span className="text-zinc-300 font-mono">${Number(pos.entryPrice).toLocaleString()}</span>
+                    <span className="text-zinc-300 font-mono">${(Number(pos.entryPrice) || 0).toLocaleString()}</span>
                   </div>
                   <div>
                     <span className="text-zinc-500 block uppercase">Mark Price</span>
-                    <span className="text-zinc-300 font-mono">${Number(pos.markPrice).toLocaleString()}</span>
+                    <span className="text-zinc-300 font-mono">${(Number(pos.markPrice) || 0).toLocaleString()}</span>
                   </div>
                   <div>
                     <span className="text-zinc-500 block uppercase">Size</span>
@@ -4879,9 +5140,18 @@ const JournalTab = ({
                   </div>
                   <div>
                     <span className="text-zinc-500 block uppercase">Liq. Price</span>
-                    <span className="text-rose-400 font-mono font-bold">${Number(pos.liquidationPrice).toLocaleString()}</span>
+                    <span className="text-rose-400 font-mono font-bold">
+                      {(Number(pos.liquidationPrice) || 0) > 0 ? `$${Number(pos.liquidationPrice).toLocaleString()}` : 'None'}
+                    </span>
                   </div>
                 </div>
+                <button 
+                  onClick={() => setLoggingPosition(pos)}
+                  className="mt-3 w-full py-2 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-500 text-[10px] font-bold uppercase rounded-lg border border-emerald-500/20 transition-colors flex items-center justify-center gap-2"
+                >
+                  <PlusCircle className="w-3 h-3" />
+                  Add to Journal
+                </button>
               </div>
             ))}
           </div>
@@ -4900,7 +5170,14 @@ const JournalTab = ({
               <div className="flex items-center gap-2">
                 <div className={cn("w-2 h-2 rounded-full", t.direction === 'LONG' ? "bg-emerald-500" : "bg-rose-500")} />
                 <div>
-                  <div className="text-sm font-bold text-zinc-100">{t.symbol}</div>
+                  <div className="flex items-center gap-2">
+                    <div className="text-sm font-bold text-zinc-100">{t.symbol}</div>
+                    {isPositionLive(t) && (
+                      <span className="text-[8px] font-bold px-1 py-0.5 rounded bg-blue-500/10 text-blue-500 border border-blue-500/20 animate-pulse">
+                        LIVE
+                      </span>
+                    )}
+                  </div>
                   <div className="text-[10px] text-zinc-500">{format(new Date(t.date), 'MMM dd, HH:mm')}</div>
                 </div>
               </div>
@@ -4914,7 +5191,7 @@ const JournalTab = ({
             <div className="grid grid-cols-3 gap-2 py-2 border-y border-zinc-800/50">
               <div>
                 <span className="text-[8px] text-zinc-500 uppercase block">Entry</span>
-                <span className="text-xs font-mono text-zinc-300">${t.entryPrice.toLocaleString()}</span>
+                <span className="text-xs font-mono text-zinc-300">${(t.entryPrice || 0).toLocaleString()}</span>
               </div>
               <div>
                 <span className="text-[8px] text-zinc-500 uppercase block">Size</span>
@@ -4923,7 +5200,7 @@ const JournalTab = ({
               <div>
                 <span className="text-[8px] text-zinc-500 uppercase block">PNL</span>
                 <span className={cn("text-xs font-mono font-bold", (t.netPnl || 0) >= 0 ? "text-emerald-500" : "text-rose-500")}>
-                  {t.status === 'CLOSED' ? `$${t.netPnl.toFixed(2)}` : '—'}
+                  {t.status === 'CLOSED' ? `$${(t.netPnl || 0).toFixed(2)}` : '—'}
                 </span>
               </div>
             </div>
@@ -4969,15 +5246,27 @@ const JournalTab = ({
             {binancePositions.map((pos, idx) => (
               <div key={idx} className="crypto-card bg-emerald-500/5 border-emerald-500/20 p-4">
                 <div className="flex justify-between items-start mb-2">
-                  <span className="text-sm font-bold text-zinc-100">{pos.symbol}</span>
+                  <div className="flex items-center gap-2">
+                    <span className="text-sm font-bold text-zinc-100">{pos.symbol}</span>
+                    <div className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                  </div>
                   <span className={cn("text-xs font-mono font-bold", pos.unrealizedPnl >= 0 ? "text-emerald-500" : "text-rose-500")}>
                     ${Number(pos.unrealizedPnl).toFixed(2)}
                   </span>
                 </div>
-                <div className="flex justify-between text-[10px] text-zinc-500">
+                <div className="flex justify-between text-[10px] text-zinc-500 mb-2">
                   <span>{pos.side.toUpperCase()} {pos.leverage}x</span>
-                  <span className="text-rose-400 font-bold">Liq: ${Number(pos.liquidationPrice).toLocaleString()}</span>
+                  <span className="text-rose-400 font-bold">
+                    Liq: {(Number(pos.liquidationPrice) || 0) > 0 ? `$${Number(pos.liquidationPrice).toLocaleString()}` : 'None'}
+                  </span>
                 </div>
+                <button 
+                  onClick={() => setLoggingPosition(pos)}
+                  className="w-full py-1.5 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-500 text-[9px] font-bold uppercase rounded border border-emerald-500/20 transition-colors flex items-center justify-center gap-1.5"
+                >
+                  <PlusCircle className="w-2.5 h-2.5" />
+                  Add to Journal
+                </button>
               </div>
             ))}
           </div>
@@ -5063,7 +5352,14 @@ const JournalTab = ({
                   </td>
                   <td className="px-4 py-4">
                     <div className="flex flex-col gap-1">
-                      <span className="text-sm font-bold text-zinc-100">{t.symbol}</span>
+                      <div className="flex items-center gap-2">
+                        <span className="text-sm font-bold text-zinc-100">{t.symbol}</span>
+                        {isPositionLive(t) && (
+                          <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-blue-500/10 text-blue-500 border border-blue-500/20 animate-pulse">
+                            LIVE
+                          </span>
+                        )}
+                      </div>
                       <div className="flex items-center gap-2">
                         <span className={cn("text-[10px] font-bold px-1.5 py-0.5 rounded", 
                           t.direction === 'LONG' ? "bg-emerald-500/10 text-emerald-500" : "bg-rose-500/10 text-rose-500"
@@ -5083,13 +5379,13 @@ const JournalTab = ({
                     <div className="flex flex-col gap-1">
                       <div className="flex items-center gap-2">
                         <span className="text-[10px] text-zinc-500 font-mono w-3">$</span>
-                        <span className="text-xs text-zinc-100 font-mono">${t.riskAmount.toFixed(2)}</span>
+                        <span className="text-xs text-zinc-100 font-mono">${(t.riskAmount || 0).toFixed(2)}</span>
                       </div>
                       <div className="flex items-center gap-2">
                         <span className="text-[10px] text-zinc-500 font-mono w-3">M</span>
-                        <span className="text-xs text-zinc-100 font-mono">${(t.initialMargin + (t.addedMargin || 0)).toFixed(2)}</span>
-                        {t.addedMargin > 0 && (
-                          <span className="text-[9px] text-emerald-500 font-bold">+{t.addedMargin.toFixed(1)}</span>
+                        <span className="text-xs text-zinc-100 font-mono">${((t.initialMargin || 0) + (t.addedMargin || 0)).toFixed(2)}</span>
+                        {(t.addedMargin || 0) > 0 && (
+                          <span className="text-[9px] text-emerald-500 font-bold">+{(t.addedMargin || 0).toFixed(1)}</span>
                         )}
                       </div>
                     </div>
@@ -5098,22 +5394,22 @@ const JournalTab = ({
                     <div className="flex flex-col gap-1">
                       <div className="flex items-center gap-2">
                         <span className="text-[10px] text-zinc-500 font-mono w-4">EP</span>
-                        <span className="text-xs text-zinc-100 font-mono">{t.entryPrice.toLocaleString()}</span>
+                        <span className="text-xs text-zinc-100 font-mono">{(t.entryPrice || 0).toLocaleString()}</span>
                       </div>
                       <div className="flex items-center gap-2">
                         <span className="text-[10px] text-zinc-500 font-mono w-4">SL</span>
-                        <span className="text-xs text-zinc-100 font-mono text-rose-400">{t.stopLoss.toLocaleString()}</span>
+                        <span className="text-xs text-zinc-100 font-mono text-rose-400">{(t.stopLoss || 0).toLocaleString()}</span>
                       </div>
                       {t.takeProfit && (
                         <div className="flex items-center gap-2">
                           <span className="text-[10px] text-zinc-500 font-mono w-4">TP</span>
-                          <span className="text-xs text-zinc-100 font-mono text-emerald-400">{t.takeProfit.toLocaleString()}</span>
+                          <span className="text-xs text-zinc-100 font-mono text-emerald-400">{(t.takeProfit || 0).toLocaleString()}</span>
                         </div>
                       )}
                       {t.status === 'OPEN' && t.liquidationPrice > 0 && (
                         <div className="flex items-center gap-2">
                           <span className="text-[10px] text-amber-500 font-bold font-mono w-4">LQ</span>
-                          <span className="text-xs text-amber-500 font-mono font-bold">{t.liquidationPrice.toLocaleString()}</span>
+                          <span className="text-xs text-amber-500 font-mono font-bold">{(t.liquidationPrice || 0).toLocaleString()}</span>
                         </div>
                       )}
                     </div>
@@ -5129,9 +5425,9 @@ const JournalTab = ({
                   </td>
                   <td className="px-4 py-4">
                     <div className="flex flex-col gap-1">
-                      <span className="text-xs font-mono font-bold text-zinc-100">P: {t.plannedRR.toFixed(2)}R</span>
+                      <span className="text-xs font-mono font-bold text-zinc-100">P: {(t.plannedRR || 0).toFixed(2)}R</span>
                       {t.status === 'CLOSED' && (
-                        <span className={cn("text-xs font-mono font-bold", (t.actualRR || 0) >= t.plannedRR ? "text-emerald-500" : "text-rose-500")}>
+                        <span className={cn("text-xs font-mono font-bold", (t.actualRR || 0) >= (t.plannedRR || 0) ? "text-emerald-500" : "text-rose-500")}>
                           A: {t.actualRR?.toFixed(2)}R
                         </span>
                       )}
@@ -5145,8 +5441,8 @@ const JournalTab = ({
                       </div>
                     ) : (
                       <div className="flex flex-col">
-                        <span className={cn("text-xs font-mono font-bold", t.netPnl >= 0 ? "text-emerald-500" : "text-rose-500")}>
-                          {t.netPnl >= 0 ? '+' : ''}${t.netPnl.toFixed(2)}
+                        <span className={cn("text-xs font-mono font-bold", (t.netPnl || 0) >= 0 ? "text-emerald-500" : "text-rose-500")}>
+                          {(t.netPnl || 0) >= 0 ? '+' : ''}${(t.netPnl || 0).toFixed(2)}
                         </span>
                         <span className="text-[10px] text-zinc-500">Net PNL</span>
                       </div>
@@ -5166,7 +5462,7 @@ const JournalTab = ({
                         </div>
                         {t.slippagePercent !== undefined && (
                           <span className={cn("text-[9px] font-mono", t.slippagePercent > 0.1 ? "text-rose-500" : "text-zinc-500")}>
-                            Slip: {t.slippagePercent.toFixed(2)}%
+                            Slip: {(t.slippagePercent || 0).toFixed(2)}%
                           </span>
                         )}
                       </div>
@@ -5315,6 +5611,25 @@ const JournalTab = ({
           trade={addingMarginTrade}
           onClose={() => setAddingMarginTrade(null)}
           onSave={onUpdateTrade}
+        />
+      )}
+
+      {loggingPosition && loggingResults && (
+        <LogTradeModal 
+          results={loggingResults}
+          symbol={loggingPosition.symbol}
+          direction={loggingPosition.side.toUpperCase()}
+          leverage={loggingPosition.leverage}
+          entryPrice={Number(loggingPosition.entryPrice)}
+          stopLoss={0}
+          takeProfit={0}
+          currentBalance={currentBalance}
+          onClose={() => setLoggingPosition(null)}
+          onSave={(trade: Trade) => {
+            onLogTrade(trade);
+            setLoggingPosition(null);
+          }}
+          showNotification={showNotification}
         />
       )}
 
@@ -5729,7 +6044,7 @@ const StatsTab = ({
               <span className="text-[10px] text-emerald-500/70 uppercase font-bold tracking-widest">Current Balance</span>
               <div className="flex items-baseline gap-1">
                 <span className="text-2xl font-mono font-bold text-emerald-500">
-                  ${currentBalance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                  ${(currentBalance || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                 </span>
                 <span className="text-[10px] text-emerald-500/40 font-mono">USDT</span>
               </div>
@@ -5987,7 +6302,7 @@ const StatsTab = ({
               <Edit3 className="w-3 h-3" />
             </button>
           </div>
-          <div className="text-2xl font-mono font-bold text-blue-500 mt-1">{stats.profitFactor.toFixed(2)}</div>
+          <div className="text-2xl font-mono font-bold text-blue-500 mt-1">{(stats.profitFactor || 0).toFixed(2)}</div>
           <div className="text-[10px] text-zinc-500 mt-1">Avg W/L: {(stats.avgWin / (stats.avgLoss || 1)).toFixed(2)}</div>
         </div>
         <div className="crypto-card relative">
@@ -6001,10 +6316,10 @@ const StatsTab = ({
               <Edit3 className="w-3 h-3" />
             </button>
           </div>
-          <div className={cn("text-2xl font-mono font-bold mt-1", stats.totalNetPnl >= 0 ? "text-emerald-500" : "text-rose-500")}>
-            ${stats.totalNetPnl.toFixed(2)}
+          <div className={cn("text-2xl font-mono font-bold mt-1", (stats.totalNetPnl || 0) >= 0 ? "text-emerald-500" : "text-rose-500")}>
+            ${(stats.totalNetPnl || 0).toFixed(2)}
           </div>
-          <div className="text-[10px] text-zinc-500 mt-1">Fees: ${stats.totalFees.toFixed(2)}</div>
+          <div className="text-[10px] text-zinc-500 mt-1">Fees: ${(stats.totalFees || 0).toFixed(2)}</div>
         </div>
         <div className="crypto-card relative">
           <div className="flex justify-between items-start">
@@ -6042,12 +6357,12 @@ const StatsTab = ({
               </button>
             </div>
           </div>
-          <div className="text-2xl font-mono font-bold text-rose-500 mt-1">{stats.maxDrawdownPercent.toFixed(1)}%</div>
-          <div className="text-[10px] text-zinc-500 mt-1">Current: {stats.currentDrawdownPercent.toFixed(1)}%</div>
+          <div className="text-2xl font-mono font-bold text-rose-500 mt-1">{(stats.maxDrawdownPercent || 0).toFixed(1)}%</div>
+          <div className="text-[10px] text-zinc-500 mt-1">Current: {(stats.currentDrawdownPercent || 0).toFixed(1)}%</div>
         </div>
         <div className="crypto-card">
           <span className="text-[10px] text-zinc-500 uppercase font-bold tracking-wider">Kelly Criterion</span>
-          <div className="text-2xl font-mono font-bold text-amber-500 mt-1">{stats.kellyCriterion.toFixed(1)}%</div>
+          <div className="text-2xl font-mono font-bold text-amber-500 mt-1">{(stats.kellyCriterion || 0).toFixed(1)}%</div>
           <div className="text-[10px] text-zinc-500 mt-1">Suggested risk per trade</div>
         </div>
       </div>

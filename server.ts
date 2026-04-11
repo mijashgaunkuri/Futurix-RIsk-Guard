@@ -277,33 +277,71 @@ async function startServer() {
         enableRateLimit: true
       });
 
-      // Fetch balance
+      // 1. Fetch balance
       const balance = await exchange.fetchBalance();
       
-      // Fetch recent trades (last 50 for now to avoid long wait)
-      // Note: Binance fetchMyTrades requires a symbol. 
-      // We can try to fetch positions first to see what symbols the user has traded recently.
-      const positions = await exchange.fetchPositions();
-      const activeSymbols = positions
-        .filter(p => {
-          const contracts = typeof p.contracts === 'string' ? parseFloat(p.contracts) : (p.contracts || 0);
-          const notional = typeof p.notional === 'string' ? parseFloat(p.notional) : (p.notional || 0);
-          return contracts !== 0 || notional !== 0;
-        })
-        .map(p => p.symbol);
+      // 2. Find symbols with recent activity using fapiPrivateGetIncome
+      // This is much more efficient than guessing symbols
+      let income = [];
+      try {
+        income = await exchange.fapiPrivateGetIncome({ 
+          startTime: Date.now() - (7 * 24 * 60 * 60 * 1000), // Last 7 days (Binance limit is often 7 days for interval)
+          limit: 1000 
+        });
+      } catch (e) {
+        console.warn("Could not fetch income history:", e);
+      }
+      
+      const activeSymbols = new Set<string>();
+      income.forEach((item: any) => {
+        if (item.symbol) {
+          // Convert Binance symbol (BTCUSDT) to CCXT symbol (BTC/USDT)
+          let s = item.symbol;
+          if (s.endsWith('USDT')) s = s.replace('USDT', '/USDT');
+          else if (s.endsWith('BUSD')) s = s.replace('BUSD', '/BUSD');
+          activeSymbols.add(s);
+        }
+      });
 
-      // Also get some common symbols if no active positions
-      const symbolsToCheck = activeSymbols.length > 0 ? activeSymbols : ['BTC/USDT', 'ETH/USDT', 'SOL/USDT'];
+      // Also add currently open positions
+      const positions = await exchange.fetchPositions();
+      const markets = await exchange.loadMarkets();
+      
+      positions.forEach(p => {
+        const contracts = typeof p.contracts === 'string' ? parseFloat(p.contracts) : (p.contracts || 0);
+        if (contracts !== 0) activeSymbols.add(p.symbol);
+      });
+
+      const symbolsToCheck = Array.from(activeSymbols);
+      if (symbolsToCheck.length === 0) {
+        // Fallback to common symbols if no activity found
+        symbolsToCheck.push('BTC/USDT', 'ETH/USDT');
+      }
       
       const allTrades = [];
-      for (const symbol of symbolsToCheck) {
+      // Limit to top 15 active symbols to avoid rate limits if user is very active
+      const limitedSymbols = symbolsToCheck.slice(0, 15);
+
+      for (const symbol of limitedSymbols) {
         try {
-          const trades = await exchange.fetchMyTrades(symbol, undefined, 20);
+          // Ensure the symbol is in the format CCXT expects for Binance Futures
+          let ccxtSymbol = symbol;
+          if (!markets[ccxtSymbol]) {
+            // Try to find it in markets
+            const cleanSymbol = symbol.replace('/', '').replace(':USDT', '');
+            const found = Object.keys(markets).find(m => m.replace('/', '').replace(':USDT', '') === cleanSymbol);
+            if (found) ccxtSymbol = found;
+          }
+          
+          const trades = await exchange.fetchMyTrades(ccxtSymbol, undefined, 50);
           allTrades.push(...trades);
         } catch (e) {
           console.error(`Failed to fetch trades for ${symbol}:`, e);
         }
       }
+
+      // Sort trades by timestamp descending
+      allTrades.sort((a, b) => b.timestamp - a.timestamp);
 
       res.json({
         balance: balance.total,
@@ -311,15 +349,15 @@ async function startServer() {
           id: t.id,
           symbol: t.symbol,
           date: t.datetime,
-          direction: t.side.toUpperCase(),
+          direction: t.side.toUpperCase() === 'BUY' ? 'LONG' : 'SHORT',
           entryPrice: t.price,
           quantity: t.amount,
           notionalValue: t.cost,
           fees: t.fee ? t.fee.cost : 0,
-          pnl: (t as any).realizedPnl || 0, // Realized PnL if available
+          pnl: (t as any).realizedPnl || (t.info ? parseFloat((t.info as any).realizedPnl) : 0) || 0,
           status: 'CLOSED'
         })),
-        info: "Binance sync completed successfully."
+        info: `Binance sync completed. Fetched trades from ${limitedSymbols.length} active symbols.`
       });
     } catch (error: any) {
       console.error("Binance Sync Error:", error);
