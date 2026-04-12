@@ -1,4 +1,7 @@
-import { LucideIcon } from 'lucide-react';
+/**
+ * @license
+ * SPDX-License-Identifier: Apache-2.0
+ */
 
 export type TradeDirection = 'LONG' | 'SHORT';
 
@@ -11,9 +14,7 @@ export interface Trade {
   entryPrice: number;
   expectedEntryPrice?: number;
   stopLoss: number;
-  takeProfit?: number;
-  exitPrice?: number;
-  expectedExitPrice?: number;
+  takeProfit: number | null;
   quantity: number;
   notionalValue: number;
   initialMargin: number;
@@ -23,56 +24,63 @@ export interface Trade {
   pnl: number;
   fees: number;
   netPnl: number;
-  slippagePercent?: number;
-  slippageUsdt?: number;
   strategy: string;
   timeframe: string;
   notes: string;
   emotion: string;
-  postTradeReflection?: string;
-  exitRationale?: string;
   tags: string[];
   status: 'OPEN' | 'CLOSED';
+  exitPrice?: number;
+  exitDate?: string;
   marginMode: 'ISOLATED' | 'CROSS';
   addedMargin: number;
   plannedRR: number;
   actualRR?: number;
-  balanceBefore: number;
-  balanceAfter?: number;
-  highestPriceReached?: number;
-  lowestPriceReached?: number;
-  mfeUsdt?: number;
-  maeUsdt?: number;
-  mfePercent?: number;
-  maePercent?: number;
   exitEfficiency?: number;
-  isBreakevenMoved?: boolean;
-  partialExitsCount?: number;
-  isRevengeTrade?: boolean;
-  followedPlan?: 'YES' | 'PARTIAL' | 'NO';
+  balanceBefore: number;
   safetyBufferAtEntry?: number;
   liqDistAtEntry?: number;
-  durationMinutes?: number;
   entryImage1h?: string;
-  exitImage5min?: string;
-  // Real Binance matching update – April 2026
+  exitImage1h?: string;
   entryOrderType?: 'MAKER' | 'TAKER';
   exitTpOrderType?: 'MAKER' | 'TAKER';
   exitSlOrderType?: 'MAKER' | 'TAKER';
   estimatedHoldHours?: number;
   fundingRatePerInterval?: number;
   fundingIntervalHours?: number;
-  effectiveEntryPrice?: number;
-  effectiveExitPrice?: number;
-  fundingPnL?: number;
-  finalLeverageUsed?: number;
   useDiscount?: boolean;
   makerFee?: number;
   takerFee?: number;
+  fundingPnL?: number;
+  effectiveEntryPrice?: number;
+  effectiveExitPrice?: number;
   atr?: number;
   avgOrderBookDepth?: number;
   avgFundingRate?: number;
   adjustedRiskPercent?: number;
+  highestPriceReached?: number;
+  lowestPriceReached?: number;
+  exitRationale?: string;
+  postTradeReflection?: string;
+  followedPlan?: 'YES' | 'PARTIAL' | 'NO';
+  mfeUsdt?: number;
+  maeUsdt?: number;
+  mfePercent?: number;
+  maePercent?: number;
+  slippageUsdt?: number;
+  slippagePercent?: number;
+  durationMinutes?: number;
+  isRevengeTrade?: boolean;
+  partialExitsCount?: number;
+  isBreakevenMoved?: boolean;
+  expectedExitPrice?: number;
+  exitImage5min?: string;
+  finalLeverageUsed?: number;
+  behavioralTags?: string[];
+  psychologicalScore?: number;
+  mae?: number;
+  mfe?: number;
+  slippage?: number;
 }
 
 export interface BalanceHistory {

@@ -10,78 +10,82 @@ dotenv.config();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-async function startServer() {
-  const app = express();
-  const PORT = 3000;
+/**
+ * PRODUCTION-GRADE BINANCE FUTURES CLIENT
+ * Encapsulates CCXT logic with retries and robust error handling.
+ */
+class BinanceClient {
+  private static instances: Map<string, any> = new Map();
+  private exchange: any;
+  private apiKey: string | undefined;
+  private apiSecret: string | undefined;
 
-  app.use(express.json());
-
-  // API routes
-  app.get("/api/health", (req, res) => {
-    res.json({ status: "ok" });
-  });
-
-  // Binance Symbol Data API for Calculator
-  app.get("/api/binance/symbol-data", async (req, res) => {
-    let { symbol } = req.query;
-    if (!symbol) return res.status(400).json({ error: "Symbol is required" });
-
-    // Normalize symbol (e.g., LTC/USDT.P -> LTC/USDT, BTCUSDT -> BTC/USDT)
-    let normalizedSymbol = (symbol as string).toUpperCase();
+  constructor(apiKey?: string, apiSecret?: string) {
+    this.apiKey = apiKey || process.env.BINANCE_API_KEY;
+    this.apiSecret = apiSecret || process.env.BINANCE_API_SECRET;
     
-    // Remove common suffixes
-    normalizedSymbol = normalizedSymbol.replace('.P', '');
-    normalizedSymbol = normalizedSymbol.replace(':USDT', '');
+    const instanceKey = `${this.apiKey || 'public'}_${this.apiSecret || 'public'}`;
     
-    // Ensure slash format for CCXT Binance
-    if (!normalizedSymbol.includes('/')) {
-      if (normalizedSymbol.endsWith('USDT')) {
-        normalizedSymbol = normalizedSymbol.replace('USDT', '/USDT');
-      } else if (normalizedSymbol.endsWith('BUSD')) {
-        normalizedSymbol = normalizedSymbol.replace('BUSD', '/BUSD');
+    if (BinanceClient.instances.has(instanceKey)) {
+      this.exchange = BinanceClient.instances.get(instanceKey)!;
+    } else {
+      this.exchange = new ccxt.binance({
+        apiKey: this.apiKey,
+        secret: this.apiSecret,
+        options: { defaultType: 'future' },
+        enableRateLimit: true,
+        timeout: 30000,
+      });
+      BinanceClient.instances.set(instanceKey, this.exchange);
+    }
+  }
+
+  async executeWithRetry<T>(fn: (exchange: any) => Promise<T>, retries = 3): Promise<T> {
+    let lastError: any;
+    for (let i = 0; i < retries + 1; i++) {
+      try {
+        return await fn(this.exchange);
+      } catch (error: any) {
+        lastError = error;
+        const isRateLimit = error instanceof ccxt.RateLimitExceeded || 
+                           (error.message && error.message.toLowerCase().includes('rate limit')) ||
+                           (error.message && error.message.toLowerCase().includes('rate exceeded'));
+        
+        if (error instanceof ccxt.NetworkError || isRateLimit) {
+          const delay = isRateLimit ? 2000 * Math.pow(2, i) : 1000 * (i + 1);
+          console.warn(`Binance API attempt ${i + 1} failed (${isRateLimit ? 'Rate Limit' : 'Network'}), retrying in ${delay}ms...`, error.message);
+          if (i < retries) await new Promise(resolve => setTimeout(resolve, delay));
+          continue;
+        }
+        throw error;
       }
     }
+    throw lastError;
+  }
 
-    const apiKey = process.env.BINANCE_API_KEY;
-    const apiSecret = process.env.BINANCE_API_SECRET;
+  async getSymbolData(symbol: string) {
+    return this.executeWithRetry(async (ex) => {
+      const ticker = await ex.fetchTicker(symbol);
+      const funding = await ex.fetchFundingRate(symbol);
+      const markets = await ex.loadMarkets();
+      const market = markets[symbol];
 
-    try {
-      const exchange = new ccxt.binance({
-        apiKey: apiKey || undefined,
-        secret: apiSecret || undefined,
-        options: { defaultType: 'future' },
-        enableRateLimit: true
-      });
+      if (!market) throw new Error(`Market ${symbol} not found`);
 
-      // Fetch ticker for current price
-      const ticker = await exchange.fetchTicker(normalizedSymbol);
-      
-      // Fetch funding rate
-      const funding = await exchange.fetchFundingRate(normalizedSymbol);
-
-      // Fetch market info for fees and precision
-      const markets = await exchange.loadMarkets();
-      const market = markets[normalizedSymbol];
-
-      if (!market) {
-        throw new Error(`Market ${normalizedSymbol} not found on Binance Futures`);
-      }
-
-      // Fetch Leverage Brackets (Requires API Key)
       let brackets = [];
-      if (apiKey && apiSecret) {
+      if (this.apiKey && this.apiSecret) {
         try {
-          brackets = await exchange.fapiPrivateGetLeverageBracket({ symbol: normalizedSymbol.replace('/', '') });
+          brackets = await ex.fapiPrivateGetLeverageBracket({ symbol: symbol.replace('/', '').replace(':USDT', '') });
         } catch (e) {
           console.warn("Could not fetch leverage brackets:", e);
         }
       }
 
-      res.json({
-        symbol: normalizedSymbol,
+      return {
+        symbol,
         price: ticker.last,
         markPrice: (ticker as any).markPrice || ticker.last,
-        fundingRate: funding.fundingRate * 100, // Convert to %
+        fundingRate: funding.fundingRate * 100,
         fundingIntervalHours: 8,
         makerFee: (market as any).maker * 100 || 0.02,
         takerFee: (market as any).taker * 100 || 0.05,
@@ -91,137 +95,14 @@ async function startServer() {
         quantityPrecision: market.precision.amount,
         pricePrecision: market.precision.price,
         leverageBrackets: brackets,
-        info: `Live data for ${normalizedSymbol} fetched successfully.`
-      });
-    } catch (error: any) {
-      console.error("Binance Symbol Data Error:", error);
-      res.status(500).json({ error: error.message });
-    }
-  });
+      };
+    });
+  }
 
-  // Binance Execute Trade API
-  app.post("/api/binance/execute-trade", async (req, res) => {
-    const apiKey = process.env.BINANCE_API_KEY;
-    const apiSecret = process.env.BINANCE_API_SECRET;
-
-    if (!apiKey || !apiSecret) {
-      return res.status(401).json({ error: "Binance API keys not configured in Settings." });
-    }
-
-    let { 
-      symbol, 
-      direction, 
-      type, 
-      entryPrice, 
-      quantity, 
-      leverage, 
-      marginMode,
-      stopLoss,
-      takeProfit
-    } = req.body;
-
-    // Normalize symbol
-    let normalizedSymbol = (symbol as string).toUpperCase();
-    normalizedSymbol = normalizedSymbol.replace('.P', '');
-    normalizedSymbol = normalizedSymbol.replace(':USDT', '');
-    if (!normalizedSymbol.includes('/')) {
-      if (normalizedSymbol.endsWith('USDT')) normalizedSymbol = normalizedSymbol.replace('USDT', '/USDT');
-      else if (normalizedSymbol.endsWith('BUSD')) normalizedSymbol = normalizedSymbol.replace('BUSD', '/BUSD');
-    }
-
-    try {
-      const exchange = new ccxt.binance({
-        apiKey,
-        secret: apiSecret,
-        options: { defaultType: 'future' },
-        enableRateLimit: true
-      });
-
-      // 1. Set Margin Mode
-      try {
-        await exchange.setMarginMode(marginMode, normalizedSymbol);
-      } catch (e: any) {
-        // Ignore if already set to the same mode
-        if (!e.message.includes("No need to change margin type")) {
-          console.warn("Margin mode set error:", e.message);
-        }
-      }
-
-      // 2. Set Leverage
-      await exchange.setLeverage(leverage, normalizedSymbol);
-
-      // 3. Place Entry Order
-      const side = direction === 'LONG' ? 'buy' : 'sell';
-      const orderType = type.toLowerCase(); // 'limit' or 'market'
-      
-      const entryOrder = await exchange.createOrder(
-        normalizedSymbol,
-        orderType,
-        side,
-        quantity,
-        orderType === 'limit' ? entryPrice : undefined
-      );
-
-      const orders = [entryOrder];
-
-      // 4. Place Stop Loss (Stop Market)
-      if (stopLoss) {
-        const slSide = side === 'buy' ? 'sell' : 'buy';
-        const slOrder = await exchange.createOrder(
-          normalizedSymbol,
-          'STOP_MARKET',
-          slSide,
-          quantity,
-          undefined,
-          { stopPrice: stopLoss, reduceOnly: true }
-        );
-        orders.push(slOrder);
-      }
-
-      // 5. Place Take Profit (Limit Order)
-      if (takeProfit) {
-        const tpSide = side === 'buy' ? 'sell' : 'buy';
-        const tpOrder = await exchange.createOrder(
-          normalizedSymbol,
-          'LIMIT',
-          tpSide,
-          quantity,
-          takeProfit,
-          { reduceOnly: true }
-        );
-        orders.push(tpOrder);
-      }
-
-      res.json({
-        success: true,
-        message: `Successfully executed ${direction} ${normalizedSymbol} trade on Binance.`,
-        orders
-      });
-    } catch (error: any) {
-      console.error("Binance Execution Error:", error);
-      res.status(500).json({ error: error.message });
-    }
-  });
-
-  // Binance Balance API
-  app.get("/api/binance/balance", async (req, res) => {
-    const apiKey = process.env.BINANCE_API_KEY;
-    const apiSecret = process.env.BINANCE_API_SECRET;
-
-    if (!apiKey || !apiSecret) {
-      return res.status(401).json({ error: "Binance API keys not configured." });
-    }
-
-    try {
-      const exchange = new ccxt.binance({
-        apiKey,
-        secret: apiSecret,
-        options: { defaultType: 'future' },
-        enableRateLimit: true
-      });
-
-      const balance = await exchange.fetchBalance();
-      const positions = await exchange.fetchPositions();
+  async getBalance() {
+    return this.executeWithRetry(async (ex) => {
+      const balance = await ex.fetchBalance();
+      const positions = await ex.fetchPositions();
       
       const activePositions = positions.filter(p => {
         const contracts = typeof p.contracts === 'string' ? parseFloat(p.contracts) : (p.contracts || 0);
@@ -233,7 +114,7 @@ async function startServer() {
         return acc + margin;
       }, 0);
 
-      res.json({
+      return {
         total: balance.total,
         free: balance.free,
         used: balance.used,
@@ -251,9 +132,136 @@ async function startServer() {
           liquidationPrice: p.liquidationPrice,
           marginType: (p as any).marginType || (p.info ? (p.info as any).marginType : 'unknown')
         }))
-      });
+      };
+    });
+  }
+}
+
+// Simple in-memory cache
+const cache: Map<string, { data: any, timestamp: number }> = new Map();
+const CACHE_TTL = 30000; // 30 seconds
+
+function normalizeSymbol(symbol: string): string {
+  let normalized = symbol.toUpperCase().replace('.P', '').replace(':USDT', '');
+  if (!normalized.includes('/')) {
+    if (normalized.endsWith('USDT')) normalized = normalized.replace('USDT', '/USDT');
+    else if (normalized.endsWith('BUSD')) normalized = normalized.replace('BUSD', '/BUSD');
+  }
+  return normalized;
+}
+
+async function startServer() {
+  const app = express();
+  const PORT = 3000;
+
+  app.use(express.json());
+
+  // API routes
+  app.get("/api/health", (req, res) => {
+    res.json({ status: "ok", timestamp: new Date().toISOString() });
+  });
+
+  // Binance Symbol Data API
+  app.get("/api/binance/symbol-data", async (req, res) => {
+    const { symbol } = req.query;
+    if (!symbol) return res.status(400).json({ error: "Symbol is required" });
+
+    const cacheKey = `symbol_${symbol}`;
+    const cached = cache.get(cacheKey);
+    if (cached && Date.now() - cached.timestamp < 10000) { // 10s cache for symbol data
+      return res.json(cached.data);
+    }
+
+    try {
+      const client = new BinanceClient();
+      const data = await client.getSymbolData(normalizeSymbol(symbol as string));
+      cache.set(cacheKey, { data, timestamp: Date.now() });
+      res.json(data);
     } catch (error: any) {
-      console.error("Binance Balance Error:", error);
+      console.error("Binance Symbol Data Error:", error.message);
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // Binance Execute Trade API
+  app.post("/api/binance/execute-trade", async (req, res) => {
+    const apiKey = process.env.BINANCE_API_KEY;
+    const apiSecret = process.env.BINANCE_API_SECRET;
+
+    if (!apiKey || !apiSecret) {
+      return res.status(401).json({ error: "Binance API keys not configured." });
+    }
+
+    const { 
+      symbol, direction, type, entryPrice, quantity, leverage, marginMode, stopLoss, takeProfit 
+    } = req.body;
+
+    const normalized = normalizeSymbol(symbol);
+
+    try {
+      const client = new BinanceClient(apiKey, apiSecret);
+      const result = await client.executeWithRetry(async (ex) => {
+        // 1. Set Margin Mode
+        try {
+          await ex.setMarginMode(marginMode, normalized);
+        } catch (e: any) {
+          if (!e.message.includes("No need to change margin type")) console.warn("Margin mode error:", e.message);
+        }
+
+        // 2. Set Leverage
+        await ex.setLeverage(leverage, normalized);
+
+        // 3. Place Entry Order
+        const side = direction === 'LONG' ? 'buy' : 'sell';
+        const orderType = type.toLowerCase();
+        
+        const entryOrder = await ex.createOrder(normalized, orderType, side, quantity, orderType === 'limit' ? entryPrice : undefined);
+        const orders = [entryOrder];
+
+        // 4. Place SL
+        if (stopLoss) {
+          const slOrder = await ex.createOrder(normalized, 'STOP_MARKET', side === 'buy' ? 'sell' : 'buy', quantity, undefined, { stopPrice: stopLoss, reduceOnly: true });
+          orders.push(slOrder);
+        }
+
+        // 5. Place TP
+        if (takeProfit) {
+          const tpOrder = await ex.createOrder(normalized, 'LIMIT', side === 'buy' ? 'sell' : 'buy', quantity, takeProfit, { reduceOnly: true });
+          orders.push(tpOrder);
+        }
+
+        return { success: true, orders };
+      });
+
+      res.json(result);
+    } catch (error: any) {
+      console.error("Binance Execution Error:", error.message);
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // Binance Balance API
+  app.get("/api/binance/balance", async (req, res) => {
+    const apiKey = process.env.BINANCE_API_KEY;
+    const apiSecret = process.env.BINANCE_API_SECRET;
+
+    if (!apiKey || !apiSecret) {
+      return res.status(401).json({ error: "Binance API keys not configured." });
+    }
+
+    const cacheKey = `balance_${apiKey}`;
+    const cached = cache.get(cacheKey);
+    if (cached && Date.now() - cached.timestamp < 15000) { // 15s cache for balance
+      return res.json(cached.data);
+    }
+
+    try {
+      const client = new BinanceClient(apiKey, apiSecret);
+      const data = await client.getBalance();
+      cache.set(cacheKey, { data, timestamp: Date.now() });
+      res.json(data);
+    } catch (error: any) {
+      console.error("Binance Balance Error:", error.message);
       res.status(500).json({ error: error.message });
     }
   });
@@ -264,103 +272,122 @@ async function startServer() {
     const apiSecret = process.env.BINANCE_API_SECRET;
 
     if (!apiKey || !apiSecret) {
-      return res.status(400).json({ 
-        error: "Binance API keys not configured. Please add BINANCE_API_KEY and BINANCE_API_SECRET to your environment variables." 
-      });
+      return res.status(401).json({ error: "Binance API keys not configured." });
     }
 
     try {
-      const exchange = new ccxt.binance({
-        apiKey,
-        secret: apiSecret,
-        options: { defaultType: 'future' },
-        enableRateLimit: true
-      });
-
-      // 1. Fetch balance
-      const balance = await exchange.fetchBalance();
-      
-      // 2. Find symbols with recent activity using fapiPrivateGetIncome
-      // This is much more efficient than guessing symbols
-      let income = [];
-      try {
-        income = await exchange.fapiPrivateGetIncome({ 
-          startTime: Date.now() - (7 * 24 * 60 * 60 * 1000), // Last 7 days (Binance limit is often 7 days for interval)
-          limit: 1000 
-        });
-      } catch (e) {
-        console.warn("Could not fetch income history:", e);
-      }
-      
-      const activeSymbols = new Set<string>();
-      income.forEach((item: any) => {
-        if (item.symbol) {
-          // Convert Binance symbol (BTCUSDT) to CCXT symbol (BTC/USDT)
-          let s = item.symbol;
-          if (s.endsWith('USDT')) s = s.replace('USDT', '/USDT');
-          else if (s.endsWith('BUSD')) s = s.replace('BUSD', '/BUSD');
-          activeSymbols.add(s);
-        }
-      });
-
-      // Also add currently open positions
-      const positions = await exchange.fetchPositions();
-      const markets = await exchange.loadMarkets();
-      
-      positions.forEach(p => {
-        const contracts = typeof p.contracts === 'string' ? parseFloat(p.contracts) : (p.contracts || 0);
-        if (contracts !== 0) activeSymbols.add(p.symbol);
-      });
-
-      const symbolsToCheck = Array.from(activeSymbols);
-      if (symbolsToCheck.length === 0) {
-        // Fallback to common symbols if no activity found
-        symbolsToCheck.push('BTC/USDT', 'ETH/USDT');
-      }
-      
-      const allTrades = [];
-      // Limit to top 15 active symbols to avoid rate limits if user is very active
-      const limitedSymbols = symbolsToCheck.slice(0, 15);
-
-      for (const symbol of limitedSymbols) {
+      const client = new BinanceClient(apiKey, apiSecret);
+      const result = await client.executeWithRetry(async (ex) => {
+        const balance = await ex.fetchBalance();
+        
+        let income = [];
         try {
-          // Ensure the symbol is in the format CCXT expects for Binance Futures
-          let ccxtSymbol = symbol;
-          if (!markets[ccxtSymbol]) {
-            // Try to find it in markets
-            const cleanSymbol = symbol.replace('/', '').replace(':USDT', '');
-            const found = Object.keys(markets).find(m => m.replace('/', '').replace(':USDT', '') === cleanSymbol);
-            if (found) ccxtSymbol = found;
-          }
-          
-          const trades = await exchange.fetchMyTrades(ccxtSymbol, undefined, 50);
-          allTrades.push(...trades);
-        } catch (e) {
-          console.error(`Failed to fetch trades for ${symbol}:`, e);
+          income = await ex.fapiPrivateGetIncome({ 
+            startTime: Date.now() - (7 * 24 * 60 * 60 * 1000),
+            limit: 1000 
+          });
+        } catch (e) { console.warn("Income fetch error:", e); }
+        
+        const activeSymbols = new Set<string>();
+        income.forEach((item: any) => {
+          if (item.symbol) activeSymbols.add(normalizeSymbol(item.symbol));
+        });
+
+        const positions = await ex.fetchPositions();
+        positions.forEach(p => {
+          if (parseFloat(p.contracts as any) !== 0) activeSymbols.add(p.symbol);
+        });
+
+        const symbolsToCheck = Array.from(activeSymbols).slice(0, 15);
+        if (symbolsToCheck.length === 0) symbolsToCheck.push('BTC/USDT', 'ETH/USDT');
+        
+        const allTrades = [];
+        for (const symbol of symbolsToCheck) {
+          try {
+            const trades = await ex.fetchMyTrades(symbol, undefined, 50);
+            allTrades.push(...trades);
+          } catch (e) { console.error(`Trade fetch error for ${symbol}:`, e); }
         }
-      }
 
-      // Sort trades by timestamp descending
-      allTrades.sort((a, b) => b.timestamp - a.timestamp);
+        allTrades.sort((a, b) => b.timestamp - a.timestamp);
 
-      res.json({
-        balance: balance.total,
-        trades: allTrades.map(t => ({
-          id: t.id,
-          symbol: t.symbol,
-          date: t.datetime,
-          direction: t.side.toUpperCase() === 'BUY' ? 'LONG' : 'SHORT',
-          entryPrice: t.price,
-          quantity: t.amount,
-          notionalValue: t.cost,
-          fees: t.fee ? t.fee.cost : 0,
-          pnl: (t as any).realizedPnl || (t.info ? parseFloat((t.info as any).realizedPnl) : 0) || 0,
-          status: 'CLOSED'
-        })),
-        info: `Binance sync completed. Fetched trades from ${limitedSymbols.length} active symbols.`
+        return {
+          balance: balance.total,
+          trades: allTrades.map(t => ({
+            id: t.id,
+            symbol: t.symbol,
+            date: t.datetime,
+            direction: t.side.toUpperCase() === 'BUY' ? 'LONG' : 'SHORT',
+            entryPrice: t.price,
+            quantity: t.amount,
+            notionalValue: t.cost,
+            fees: t.fee ? t.fee.cost : 0,
+            pnl: (t as any).realizedPnl || (t.info ? parseFloat((t.info as any).realizedPnl) : 0) || 0,
+            status: 'CLOSED'
+          }))
+        };
       });
+
+      res.json(result);
     } catch (error: any) {
-      console.error("Binance Sync Error:", error);
+      console.error("Binance Sync Error:", error.message);
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // Binance Transactions API
+  app.get("/api/binance/transactions", async (req, res) => {
+    const apiKey = process.env.BINANCE_API_KEY;
+    const apiSecret = process.env.BINANCE_API_SECRET;
+
+    if (!apiKey || !apiSecret) {
+      return res.status(401).json({ error: "Binance API keys not configured." });
+    }
+
+    const cacheKey = `transactions_${apiKey}`;
+    const cached = cache.get(cacheKey);
+    if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
+      return res.json(cached.data);
+    }
+
+    try {
+      const client = new BinanceClient(apiKey, apiSecret);
+      const result = await client.executeWithRetry(async (ex) => {
+        const income = await ex.fapiPrivateGetIncome({
+          startTime: Date.now() - (7 * 24 * 60 * 60 * 1000),
+          limit: 1000
+        });
+
+        const transactions = income.map((item: any) => {
+          let type = item.incomeType;
+          let description = "";
+          switch(type) {
+            case 'TRANSFER': description = "Transfer In/Out"; break;
+            case 'REALIZED_PNL': description = `Trade PNL (${item.symbol})`; break;
+            case 'FUNDING_FEE': description = `Funding Fee (${item.symbol})`; break;
+            case 'COMMISSION': description = `Trading Fee (${item.symbol})`; break;
+            case 'INSURANCE_CLEAR': description = "Insurance Clearance"; break;
+            default: description = type;
+          }
+          return {
+            id: item.tranId,
+            symbol: item.symbol || 'USDT',
+            income: parseFloat(item.income),
+            asset: item.asset,
+            time: parseInt(item.time),
+            type: type,
+            description: description
+          };
+        });
+
+        transactions.sort((a: any, b: any) => b.time - a.time);
+        return { transactions };
+      });
+
+      cache.set(cacheKey, { data: result, timestamp: Date.now() });
+      res.json(result);
+    } catch (error: any) {
+      console.error("Binance Transactions Error:", error.message);
       res.status(500).json({ error: error.message });
     }
   });
